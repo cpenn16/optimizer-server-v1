@@ -728,6 +728,8 @@ def solve_nfl(req: SolveNFLRequest):
 
 from typing import List, Dict, Optional, Literal, Tuple, Set
 from pydantic import BaseModel, Field
+from ortools.sat.python import cp_model
+import random
 
 # ---- Models -------------------------------------------------------------
 
@@ -920,20 +922,23 @@ def _sd_solve_one(
 ) -> Optional[Tuple[List[str], int, float, Dict[str, str]]]:
     model = cp_model.CpModel()
 
-    slot_labels = [s.name for s in req.slots]
-    slot_ids: List[str] = []
+    # -------- slot ids & labels (FLEX1/FLEX2... -> "FLEX") ----------
+    slot_labels = [s.name for s in req.slots]  # UI tags: "CPT","FLEX","MVP",...
+    slot_ids: List[str] = []                   # engine ids: CPT, FLEX1, FLEX2...
     seen: Dict[str, int] = {}
     for lbl in slot_labels:
-        if lbl in ("FLEX",):
+        if lbl == "FLEX":
             seen[lbl] = seen.get(lbl, 0) + 1
-            slot_ids.append(f"{lbl}{seen[lbl]}")
+            slot_ids.append(f"FLEX{seen[lbl]}")
         else:
             slot_ids.append(lbl)
-    id_to_label = {sl: lbl for sl, lbl in zip(slot_ids, slot_labels)}
+    id_to_label = {sid: lbl for sid, lbl in zip(slot_ids, slot_labels)}  # FLEX1->FLEX etc.
 
+    # -------- index players ----------
     by_name: Dict[str, SDPlayer] = {p.name: p for p in req.players}
     names = list(by_name.keys())
 
+    # decision vars
     x: Dict[Tuple[str,str], cp_model.IntVar] = {}
     for n in names:
         for sl in slot_ids:
@@ -945,15 +950,18 @@ def _sd_solve_one(
         y[n] = var
         model.Add(sum(x[(n, sl)] for sl in slot_ids) == var)
 
+    # slot eligibility and fill
     for sl, slot in zip(slot_ids, req.slots):
         for n in names:
             if by_name[n].pos not in set(slot.eligible):
                 model.Add(x[(n, sl)] == 0)
         model.Add(sum(x[(n, sl)] for n in names) == 1)
 
+    # at most one slot per player
     for n in names:
         model.Add(sum(x[(n, sl)] for sl in slot_ids) <= 1)
 
+    # salary cap
     model.Add(
         sum(
             x[(n, sl)] * _sd_salary_for_slot(by_name[n], id_to_label[sl])
@@ -961,48 +969,78 @@ def _sd_solve_one(
         ) <= req.cap
     )
 
-    # Accept both plain-name and "Name::CPT/FLEX/MVP" forms
-    excl = set(req.excludes or [])
-    lock = set(req.locks or [])
+    # -------- slot-aware locks/excludes ----------
+    excl_raw = set(req.excludes or [])
+    lock_raw = set(req.locks or [])
 
+    # split into name-wide and slot-specific
+    name_excl = {k for k in excl_raw if "::" not in k}
+    name_lock = {k for k in lock_raw if "::" not in k}
+
+    slot_excl: Set[Tuple[str, str]] = set()
+    slot_lock: Set[Tuple[str, str]] = set()
+    for k in excl_raw:
+        if "::" in k:
+            nm, lab = k.split("::", 1)
+            slot_excl.add((nm, lab.upper()))
+    for k in lock_raw:
+        if "::" in k:
+            nm, lab = k.split("::", 1)
+            slot_lock.add((nm, lab.upper()))
+
+    # name-wide
     for n in names:
-        # Name-wide locks/excludes
-        if n in excl:
+        if n in name_excl:
             model.Add(y[n] == 0)
-        if n in lock:
-            model.Add(y[n] == 1)
+            for sl in slot_ids:
+                model.Add(x[(n, sl)] == 0)
+        if n in name_lock:
+            model.Add(y[n] == 1)  # slot chosen by solver unless slot-locked below
 
-    # Slot-specific locks/excludes
-    for sl in slot_ids:
-        key = f"{n}::{sl}"
-        if key in excl:
-            model.Add(x[(n, sl)] == 0)
-        if key in lock:
-            model.Add(x[(n, sl)] == 1)
+    # slot-specific (e.g., "Name::CPT", "Name::FLEX", "Name::MVP")
+    for n in names:
+        for sl in slot_ids:
+            tag = id_to_label[sl].upper()  # FLEX1 -> FLEX
+            if (n, tag) in slot_excl:
+                model.Add(x[(n, sl)] == 0)
+            if (n, tag) in slot_lock:
+                model.Add(x[(n, sl)] == 1)
 
-
+    # -------- exposure caps (global) ----------
     for n in names:
         if used_player_counts.get(n, 0) >= player_caps.get(n, 10**9):
             model.Add(y[n] == 0)
 
+    # -------- tag caps (per name::slotId) ----------
     for n in names:
         for sl in slot_ids:
             key = f"{n}::{sl}"
             if used_tag_counts.get(key, 0) >= tag_caps.get(key, 10**9):
                 model.Add(x[(n, sl)] == 0)
 
+    # -------- forced include for min% workflows ----------
     if forced_include:
         if "::" in forced_include:
-            nm, sl = forced_include.split("::", 1)
-            if (nm in names) and (sl in slot_ids):
-                model.Add(x[(nm, sl)] == 1)
+            nm, want_tag = forced_include.split("::", 1)
+            want_tag = want_tag.upper()
+            if nm in names:
+                # Map tag (CPT/FLEX/MVP) to engine slot ids
+                target_slots = [sl for sl in slot_ids if id_to_label[sl].upper() == want_tag]
+                # force that player into exactly one of those slots, and disallow others
+                if target_slots:
+                    model.Add(sum(x[(nm, sl)] for sl in target_slots) == 1)
+                    for sl in slot_ids:
+                        if sl not in target_slots:
+                            model.Add(x[(nm, sl)] == 0)
         elif forced_include in y:
             model.Add(y[forced_include] == 1)
 
+    # -------- lineup uniqueness (Hamming distance in names) ----------
     roster_size = len(slot_ids)
     for lineup in prior_lineups:
         model.Add(sum(y[n] for n in lineup if n in y) <= roster_size - max(1, req.min_diff))
 
+    # -------- lineup pOWN ceiling (approx, integerized) ----------
     if isinstance(req.lineup_pown_max, (int, float)) and req.lineup_pown_max is not None:
         lhs = sum(
             int(round(
@@ -1015,57 +1053,83 @@ def _sd_solve_one(
         )
         model.Add(lhs <= int(round(req.lineup_pown_max)))
 
+    # -------- IF → THEN rules (aggregated gates, team-aware) ----------
     opp_map = _sd_team_to_opp_map(req.players)
+    teams_in_slate = sorted({p.team for p in req.players})
+
+    # map tag -> list of engine slot ids
+    tag_to_slots: Dict[str, List[str]] = {}
+    for sl in slot_ids:
+        tag_to_slots.setdefault(id_to_label[sl].upper(), []).append(sl)
+
+    def any_gate(name_prefix: str, bool_vars: List[cp_model.IntVar]) -> cp_model.IntVar:
+        g = model.NewBoolVar(name_prefix)
+        if not bool_vars:
+            model.Add(g == 0)
+            return g
+        # If any b==1 -> g==1
+        for b in bool_vars:
+            model.AddImplication(b, g)
+        # If g==1 -> at least one b==1
+        model.Add(sum(bool_vars) >= g)
+        return g
+
     for ridx, r in enumerate(req.rules or []):
-        if_slot_ids = [sl for sl in slot_ids if id_to_label[sl] == r.if_slot]
-        if not if_slot_ids:
+        if_slot_tag = str(r.if_slot).upper()
+        if_pos = set(map(str.upper, r.if_pos or []))
+        from_pos = set(map(str.upper, r.from_pos or []))
+        team_scope = r.team_scope
+        team_exact = r.team_exact
+        need = int(r.then_at_least or 0)
+        if need <= 0 or not from_pos:
             continue
-        want_if_pos = set(r.if_pos)
-        want_from_pos = set(r.from_pos)
-        for if_sl in if_slot_ids:
-            g = model.NewBoolVar(f"sd_rule_{ridx}_gate_{if_sl}")
-            if_candidates = []
-            for n in names:
-                p = by_name[n]
-                if p.pos in want_if_pos and (not r.if_team_exact or p.team == r.if_team_exact):
-                    if_candidates.append(x[(n, if_sl)])
-            if not if_candidates:
-                model.Add(g == 0)
-            else:
-                s_if = sum(if_candidates)
-                model.Add(s_if >= g)
-                model.Add(s_if <= 1)
-            if r.team_scope == "any":
-                pool = [y[n] for n in names if by_name[n].pos in want_from_pos]
-                if pool:
-                    model.Add(sum(pool) >= r.then_at_least * g)
-            elif r.team_scope == "exact_team" and r.team_exact:
-                pool = [y[n] for n in names if (by_name[n].team == r.team_exact and by_name[n].pos in want_from_pos)]
-                if pool:
-                    model.Add(sum(pool) >= r.then_at_least * g)
-            else:
+
+        if_slots = tag_to_slots.get(if_slot_tag, [])
+
+        def if_candidates(filter_team: Optional[str]) -> List[cp_model.IntVar]:
+            cands: List[cp_model.IntVar] = []
+            for sl in if_slots:
                 for n in names:
                     p = by_name[n]
-                    if p.pos not in want_if_pos:
+                    if p.pos.upper() not in if_pos:
                         continue
                     if r.if_team_exact and p.team != r.if_team_exact:
                         continue
-                    is_this = x[(n, if_sl)]
-                    helper_vars: List[cp_model.IntVar] = []
-                    if r.team_scope == "same_team":
-                        for m in names:
-                            q = by_name[m]
-                            if q.team == p.team and q.pos in want_from_pos:
-                                helper_vars.append(y[m])
-                    elif r.team_scope == "opp_team":
-                        opps = opp_map.get(p.team, set())
-                        for m in names:
-                            q = by_name[m]
-                            if q.team in opps and q.pos in want_from_pos:
-                                helper_vars.append(y[m])
-                    if helper_vars:
-                        model.Add(sum(helper_vars) >= r.then_at_least * is_this)
+                    if filter_team is not None and p.team != filter_team:
+                        continue
+                    cands.append(x[(n, sl)])
+            return cands
 
+        if team_scope == "any":
+            g_any = any_gate(f"sd_rule_{ridx}_gate_any", if_candidates(None))
+            pool = [y[n] for n in names if by_name[n].pos.upper() in from_pos]
+            if pool:
+                model.Add(sum(pool) >= need * g_any)
+
+        elif team_scope == "exact_team" and team_exact:
+            g_ex = any_gate(f"sd_rule_{ridx}_gate_exact_{team_exact}", if_candidates(team_exact))
+            pool = [y[n] for n in names
+                    if by_name[n].pos.upper() in from_pos and by_name[n].team == team_exact]
+            if pool:
+                model.Add(sum(pool) >= need * g_ex)
+
+        elif team_scope in ("same_team", "opp_team"):
+            for tm in teams_in_slate:
+                g_tm = any_gate(f"sd_rule_{ridx}_gate_{team_scope}_{tm}", if_candidates(tm))
+                if team_scope == "same_team":
+                    helper = [y[n] for n in names
+                              if by_name[n].pos.upper() in from_pos and by_name[n].team == tm]
+                else:  # opp_team
+                    opps = opp_map.get(tm, set())
+                    helper = [y[n] for n in names
+                              if by_name[n].pos.upper() in from_pos and by_name[n].team in opps]
+                if helper:
+                    model.Add(sum(helper) >= need * g_tm)
+        else:
+            # unknown scope -> skip
+            pass
+
+    # -------- objective ----------
     model.Maximize(
         sum(
             int(_sd_metric_for_slot(by_name[n], id_to_label[sl], req.objective) * 1000) * x[(n, sl)]
@@ -1073,6 +1137,7 @@ def _sd_solve_one(
         )
     )
 
+    # -------- solve ----------
     solver = cp_model.CpSolver()
     if req.time_limit_ms and req.time_limit_ms > 0:
         solver.parameters.max_time_in_seconds = req.time_limit_ms / 1000.0
@@ -1148,6 +1213,7 @@ def solve_showdown_stream(req: SDSolveRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
 @app.post("/solve_showdown")
 def solve_showdown(req: SDSolveRequest):
     """
@@ -1187,7 +1253,6 @@ def solve_showdown(req: SDSolveRequest):
 
     return {"lineups": out, "produced": len(out)}
 # ========================== END SHOWDOWN SOLVER ==========================
-
 
 # === MLB MODELS & SOLVER — DROP-IN (stack teams + pitchers kept) ===
 # Relies on: cp_model, random, StreamingResponse, sse_event(...), SSE_HEADERS
