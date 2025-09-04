@@ -18,6 +18,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",  # critical for Nginx/Cloudflare
+}
+
 
 # ----------------------------- models -----------------------------
 class Player(BaseModel):
@@ -1378,6 +1384,9 @@ def solve_mlb_stream(req: SolveMLBRequest):
     caps = _cap_counts(req)
 
     def gen():
+        # heartbeat so the browser sees bytes immediately (prevents “pending”)
+        yield b":hb\n\n"
+
         produced = 0
         for i in range(req.n):
             # iteration scores with boosts + randomness
@@ -1415,8 +1424,9 @@ def solve_mlb_stream(req: SolveMLBRequest):
     return StreamingResponse(
         gen(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        headers=SSE_HEADERS,
     )
+
 
 @app.post("/solve_mlb")
 def solve_mlb(req: SolveMLBRequest):
