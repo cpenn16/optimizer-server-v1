@@ -1330,12 +1330,45 @@ def _solve_one_mlb(
     # salary cap
     model.Add(sum(y[n] * by_name[n].salary for n in names) <= req.cap)
 
-    # locks/excludes
-    excl = set(req.excludes or [])
-    lock = set(req.locks or [])
+        # locks/excludes
+    # --- slot-aware locks/excludes (DROP-IN) ---
+    excl_raw = set(req.excludes or [])
+    lock_raw = set(req.locks or [])
+
+    # Split into name-wide vs slot-specific
+    name_excl = {k for k in excl_raw if "::" not in k}
+    name_lock = {k for k in lock_raw if "::" not in k}
+
+    slot_excl = set()
+    slot_lock = set()
+    for k in excl_raw:
+        if "::" in k:
+            nm, lab = k.split("::", 1)
+            slot_excl.add((nm, lab))
+    for k in lock_raw:
+        if "::" in k:
+            nm, lab = k.split("::", 1)
+            slot_lock.add((nm, lab))
+
+    # Apply constraints
     for n in names:
-        if n in excl: model.Add(y[n] == 0)
-        if n in lock: model.Add(y[n] == 1)
+        # name-wide excludes/locks
+        if n in name_excl:
+            model.Add(y[n] == 0)
+            for sl in slot_ids:
+                model.Add(x[(n, sl)] == 0)
+        if n in name_lock:
+            model.Add(y[n] == 1)  # allows either CPT or FLEX unless slot-locked below
+
+        # slot-specific excludes/locks
+        for sl in slot_ids:
+            lab = id_to_label[sl]  # e.g., FLEX1→"FLEX"
+            if (n, lab) in slot_excl:
+                model.Add(x[(n, sl)] == 0)
+            if (n, lab) in slot_lock:
+                model.Add(x[(n, sl)] == 1)
+    # --- end slot-aware locks/excludes ---
+
 
     # exposure caps already hit across the run
     for n in names:
