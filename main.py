@@ -961,13 +961,25 @@ def _sd_solve_one(
         ) <= req.cap
     )
 
+    # Accept both plain-name and "Name::CPT/FLEX/MVP" forms
     excl = set(req.excludes or [])
     lock = set(req.locks or [])
+
     for n in names:
+        # Name-wide locks/excludes
         if n in excl:
             model.Add(y[n] == 0)
         if n in lock:
             model.Add(y[n] == 1)
+
+    # Slot-specific locks/excludes
+    for sl in slot_ids:
+        key = f"{n}::{sl}"
+        if key in excl:
+            model.Add(x[(n, sl)] == 0)
+        if key in lock:
+            model.Add(x[(n, sl)] == 1)
+
 
     for n in names:
         if used_player_counts.get(n, 0) >= player_caps.get(n, 10**9):
