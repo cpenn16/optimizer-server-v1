@@ -784,7 +784,6 @@ class SDSolveRequest(BaseModel):
     min_pct: Dict[str, float] = Field(default_factory=dict)
     max_pct: Dict[str, float] = Field(default_factory=dict)
 
-    # per-tag exposure controls: keys like "Name::CPT" / "Name::MVP" / "Name::FLEX"
     min_pct_tag: Dict[str, float] = Field(default_factory=dict)
     max_pct_tag: Dict[str, float] = Field(default_factory=dict)
 
@@ -1019,32 +1018,19 @@ def _sd_solve_one(
         if used_player_counts.get(n, 0) >= player_caps.get(n, 10**9):
             model.Add(y[n] == 0)
 
-    # ===== per-tag exposure caps (MIN/MAX) using canonical label keys =====
-    # req.max_pct_tag/min_pct_tag use keys like "Name::MVP" or "Name::FLEX".
-    # We cap by canonical label (not engine id), so a FLEX cap applies across all FLEX* slots.
+    # per-tag caps (name::slotId)
     for n in names:
-        for label, slots in tag_to_slots.items():
-            key = f"{n}::{label}"
-            cap_here = tag_caps.get(key, 10**9)
-            used_here = used_tag_counts.get(key, 0)
-            if used_here >= cap_here:
-                for sl in slots:
-                    model.Add(x[(n, sl)] == 0)
+        for sl in slot_ids:
+            key = f"{n}::{sl}"
+            if used_tag_counts.get(key, 0) >= tag_caps.get(key, 10**9):
+                model.Add(x[(n, sl)] == 0)
 
-    # forced include for min% (works with either "Name" or "Name::MVP/FLEX/CPT")
+    # forced include for min%
     if forced_include:
         if "::" in forced_include:
-            nm, lab = forced_include.split("::", 1)
-            lab = lab.upper()
-            if (nm in names) and (lab in tag_to_slots):
-                slots = tag_to_slots[lab]
-                if len(slots) == 1:
-                    model.Add(x[(nm, slots[0])] == 1)
-                else:
-                    model.Add(sum(x[(nm, sl)] for sl in slots) == 1)
-                    for sl in slot_ids:
-                        if sl not in slots:
-                            model.Add(x[(nm, sl)] == 0)
+            nm, sl = forced_include.split("::", 1)
+            if (nm in names) and (sl in slot_ids):
+                model.Add(x[(nm, sl)] == 1)
         elif forced_include in y:
             model.Add(y[forced_include] == 1)
 
@@ -1183,8 +1169,7 @@ def solve_showdown_stream(req: SDSolveRequest):
             for n in chosen:
                 used_player_counts[n] = used_player_counts.get(n, 0) + 1
             for sl, n in (slot_map or {}).items():
-                label = id_to_label[sl].upper()   # FLEX1 -> FLEX
-                key = f"{n}::{label}"
+                key = f"{n}::{sl}"
                 used_tag_counts[key] = used_tag_counts.get(key, 0) + 1
             prior.append(chosen)
             produced += 1
@@ -1233,8 +1218,7 @@ def solve_showdown(req: SDSolveRequest):
         for n in chosen:
             used_player_counts[n] = used_player_counts.get(n, 0) + 1
         for sl, n in (slot_map or {}).items():
-            label = id_to_label[sl].upper()   # FLEX1 -> FLEX
-            key = f"{n}::{label}"
+            key = f"{n}::{sl}"
             used_tag_counts[key] = used_tag_counts.get(key, 0) + 1
 
         prior.append(chosen)
@@ -1242,7 +1226,7 @@ def solve_showdown(req: SDSolveRequest):
         out.append({"drivers": ordered, "salary": salary, "total": total})
 
     return {"lineups": out, "produced": len(out)}
-# ========================== END SHOWDOWN SOLVER ============================
+# ========================== END SHOWDOWN SOLVER ==========================
 
 
 # === MLB MODELS & SOLVER — DROP-IN (stack teams + pitchers kept) ===
