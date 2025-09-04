@@ -1298,34 +1298,36 @@ def _solve_one_mlb(
             s = sum(y[n] for n in opp_hitters)
             model.Add(s <= int(req.max_hitters_vs_opp_pitcher) + M * (1 - y[p_name]))
 
-    # Hitter-only stacking — Primary
-    b_primary: dict[str, cp_model.IntVar] = {}
-    teams = sorted({by_name[n].team for n in hitters})
-    if req.primary_stack_size and req.primary_stack_size > 0 and teams:
-        M = len(hitters)
-        b_primary = {t: model.NewBoolVar(f"primary_{t}") for t in teams}
-        for t, v in b_primary.items():
-            t_hitters = [n for n in hitters if by_name[n].team == t]
-            s = sum(y[n] for n in t_hitters)
-            # v==1 => s >= primary_size ; v==0 => s <= 0 * M (free)
-            model.Add(s - req.primary_stack_size >= -M * (1 - v))
-            model.Add(s <= M * v)
-        model.Add(sum(b_primary.values()) >= 1)
+        # Hitter-only stacking — Primary (at least N hitters from exactly one team)
+        teams = sorted({by_name[n].team for n in hitters})
+        if req.primary_stack_size and req.primary_stack_size > 0 and teams:
+            b_primary = {t: model.NewBoolVar(f"primary_{t}") for t in teams}
+            for t, v in b_primary.items():
+                t_hitters = [n for n in hitters if by_name[n].team == t]
+                s = sum(y[n] for n in t_hitters)
+                # If a team is the primary, it must have at least primary_stack_size hitters
+                model.Add(s >= req.primary_stack_size * v)
+            # Exactly one primary team
+            model.Add(sum(b_primary.values()) == 1)
+        else:
+            b_primary = {}
 
-    # Hitter-only stacking — Secondary (different team than primary)
-    if req.secondary_stack_size and req.secondary_stack_size > 0 and teams:
-        M = len(hitters)
-        b_secondary = {t: model.NewBoolVar(f"secondary_{t}") for t in teams}
-        for t, v in b_secondary.items():
-            t_hitters = [n for n in hitters if by_name[n].team == t]
-            s = sum(y[n] for n in t_hitters)
-            model.Add(s - req.secondary_stack_size >= -M * (1 - v))
-            model.Add(s <= M * v)
-        # Disjoint: primary team and secondary team must differ
-        for t in teams:
-            if t in b_primary:
-                model.Add(b_primary[t] + b_secondary[t] <= 1)
-        model.Add(sum(b_secondary.values()) >= 1)
+        # Hitter-only stacking — Secondary (at least M hitters from exactly one team, different from primary)
+        if req.secondary_stack_size and req.secondary_stack_size > 0 and teams:
+            b_secondary = {t: model.NewBoolVar(f"secondary_{t}") for t in teams}
+            for t, v in b_secondary.items():
+                t_hitters = [n for n in hitters if by_name[n].team == t]
+                s = sum(y[n] for n in t_hitters)
+                # If a team is the secondary, it must have at least secondary_stack_size hitters
+                model.Add(s >= req.secondary_stack_size * v)
+            # Secondary must be different from the chosen primary
+            if b_primary:
+                for t in teams:
+                    if t in b_primary:
+                        model.Add(b_primary[t] + b_secondary[t] <= 1)
+            # Exactly one secondary team
+            model.Add(sum(b_secondary.values()) == 1)
+
 
     # FanDuel rule: lineup must include at least 3 different MLB teams (P can overlap with stacks)
     if req.site == "fd":
