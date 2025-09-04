@@ -761,12 +761,12 @@ class SDIfThenRule(BaseModel):
     # IF side
     if_slot: ShowCap = "CPT"  # "CPT"|"MVP"|"FLEX"
     if_pos: List[ShowPos] = Field(default_factory=lambda: ["QB"])
-    if_team_exact: Optional[str] = None  # e.g., "PHI" to fire only for that team
+    if_team_exact: Optional[str] = None
     # THEN side
     then_at_least: int = 1
     from_pos: List[ShowPos] = Field(default_factory=lambda: ["WR", "TE"])
     team_scope: Literal["same_team", "opp_team", "any", "exact_team"] = "same_team"
-    team_exact: Optional[str] = None  # used only if team_scope == "exact_team"
+    team_exact: Optional[str] = None
 
 class SDSolveRequest(BaseModel):
     site: Literal["dk","fd"]
@@ -776,26 +776,21 @@ class SDSolveRequest(BaseModel):
     cap: int
     objective: Literal["proj","floor","ceil","pown","opt"] = "proj"
 
-    locks: List[str] = Field(default_factory=list)       # player names
-    excludes: List[str] = Field(default_factory=list)    # player names
-    boosts: Dict[str, int] = Field(default_factory=dict) # +/- steps, 1 step = 3%
+    locks: List[str] = Field(default_factory=list)
+    excludes: List[str] = Field(default_factory=list)
+    boosts: Dict[str, int] = Field(default_factory=dict)
     randomness: float = 0.0
     global_max_pct: float = 100.0
-    min_pct: Dict[str, float] = Field(default_factory=dict)   # per-player (both slots)
-    max_pct: Dict[str, float] = Field(default_factory=dict)   # per-player (both slots)
+    min_pct: Dict[str, float] = Field(default_factory=dict)
+    max_pct: Dict[str, float] = Field(default_factory=dict)
 
-    # Per-slot exposure (keys "Name::CPT", "Name::MVP", "Name::FLEX1"...)
     min_pct_tag: Dict[str, float] = Field(default_factory=dict)
     max_pct_tag: Dict[str, float] = Field(default_factory=dict)
 
-    # Uniqueness vs prior lineups (Hamming)
     min_diff: int = 1
     time_limit_ms: int = 1500
 
-    # lineup-level pOWN% cap (sum of percentage points, e.g., 200 = 200%)
     lineup_pown_max: Optional[float] = None
-
-    # IF→THEN rules
     rules: List[SDIfThenRule] = Field(default_factory=list)
 
 # ---- Helpers ------------------------------------------------------------
@@ -893,6 +888,24 @@ def _sd_team_to_opp_map(players: List[SDPlayer]) -> Dict[str, Set[str]]:
             m.setdefault(p.team, set()).add(p.opp)
     return m
 
+def _sd_ordered_players(slot_map: Dict[str, str]) -> List[str]:
+    order: List[str] = []
+    cap = slot_map.get("CPT") or slot_map.get("MVP")
+    if cap:
+        order.append(cap)
+    i = 1
+    while True:
+        key = f"FLEX{i}"
+        if key in slot_map:
+            order.append(slot_map[key])
+            i += 1
+        else:
+            break
+    for k in sorted(slot_map.keys()):
+        if k not in ("CPT", "MVP") and not k.startswith("FLEX"):
+            order.append(slot_map[k])
+    return order
+
 # ---- Core solver --------------------------------------------------------
 
 def _sd_solve_one(
@@ -902,17 +915,11 @@ def _sd_solve_one(
     player_caps: Dict[str, int],
     forced_include: Optional[str],
     prior_lineups: List[List[str]],
-    # per-slot exposure
     used_tag_counts: Dict[str, int],
     tag_caps: Dict[str, int],
 ) -> Optional[Tuple[List[str], int, float, Dict[str, str]]]:
-    """
-    Returns (chosen_names, salary, total_metric, slot_map)
-    slot_map: {slotId -> playerName}, where slotId is unique (CPT/MVP, FLEX1..FLEX5).
-    """
     model = cp_model.CpModel()
 
-    # uniquify slot ids (FLEX may repeat from UI)
     slot_labels = [s.name for s in req.slots]
     slot_ids: List[str] = []
     seen: Dict[str, int] = {}
@@ -922,38 +929,31 @@ def _sd_solve_one(
             slot_ids.append(f"{lbl}{seen[lbl]}")
         else:
             slot_ids.append(lbl)
-
-    # map back to label for CPT/MVP logic
     id_to_label = {sl: lbl for sl, lbl in zip(slot_ids, slot_labels)}
 
     by_name: Dict[str, SDPlayer] = {p.name: p for p in req.players}
     names = list(by_name.keys())
 
-    # decision vars: x[name, slotId] in {0,1}
     x: Dict[Tuple[str,str], cp_model.IntVar] = {}
     for n in names:
         for sl in slot_ids:
             x[(n, sl)] = model.NewBoolVar(f"sd_x_{n}_{sl}")
 
-    # helper y[name] = chosen in any slot
     y: Dict[str, cp_model.IntVar] = {}
     for n in names:
         var = model.NewBoolVar(f"sd_y_{n}")
         y[n] = var
         model.Add(sum(x[(n, sl)] for sl in slot_ids) == var)
 
-    # slot fill: exactly 1 per slot; also enforce eligibility
     for sl, slot in zip(slot_ids, req.slots):
         for n in names:
             if by_name[n].pos not in set(slot.eligible):
                 model.Add(x[(n, sl)] == 0)
         model.Add(sum(x[(n, sl)] for n in names) == 1)
 
-    # each player at most 1 slot (already via y==sum x)
     for n in names:
         model.Add(sum(x[(n, sl)] for sl in slot_ids) <= 1)
 
-    # salary cap (slot-aware)
     model.Add(
         sum(
             x[(n, sl)] * _sd_salary_for_slot(by_name[n], id_to_label[sl])
@@ -961,7 +961,6 @@ def _sd_solve_one(
         ) <= req.cap
     )
 
-    # locks / excludes
     excl = set(req.excludes or [])
     lock = set(req.locks or [])
     for n in names:
@@ -970,19 +969,16 @@ def _sd_solve_one(
         if n in lock:
             model.Add(y[n] == 1)
 
-    # per-player exposure caps (across run)
     for n in names:
         if used_player_counts.get(n, 0) >= player_caps.get(n, 10**9):
             model.Add(y[n] == 0)
 
-    # per-tag (player::slot) exposure caps (across run)
     for n in names:
         for sl in slot_ids:
             key = f"{n}::{sl}"
             if used_tag_counts.get(key, 0) >= tag_caps.get(key, 10**9):
                 model.Add(x[(n, sl)] == 0)
 
-    # forced include to chase mins (tag-priority)
     if forced_include:
         if "::" in forced_include:
             nm, sl = forced_include.split("::", 1)
@@ -991,12 +987,10 @@ def _sd_solve_one(
         elif forced_include in y:
             model.Add(y[forced_include] == 1)
 
-    # min_diff (Hamming) vs prior lineups
     roster_size = len(slot_ids)
     for lineup in prior_lineups:
         model.Add(sum(y[n] for n in lineup if n in y) <= roster_size - max(1, req.min_diff))
 
-    # lineup pOWN% cap (slot-aware; sum of percentage points)
     if isinstance(req.lineup_pown_max, (int, float)) and req.lineup_pown_max is not None:
         lhs = sum(
             int(round(
@@ -1009,57 +1003,42 @@ def _sd_solve_one(
         )
         model.Add(lhs <= int(round(req.lineup_pown_max)))
 
-    # IF→THEN rules (slot/team aware)
     opp_map = _sd_team_to_opp_map(req.players)
-
     for ridx, r in enumerate(req.rules or []):
-        # match the "if_slot" to the actual unique slotId(s) with that label
         if_slot_ids = [sl for sl in slot_ids if id_to_label[sl] == r.if_slot]
         if not if_slot_ids:
             continue
-
         want_if_pos = set(r.if_pos)
         want_from_pos = set(r.from_pos)
-
         for if_sl in if_slot_ids:
-            # gate var for this IF slot instance
             g = model.NewBoolVar(f"sd_rule_{ridx}_gate_{if_sl}")
-
-            # g turns on iff some candidate (pos + optional team) is in that slot
             if_candidates = []
             for n in names:
                 p = by_name[n]
                 if p.pos in want_if_pos and (not r.if_team_exact or p.team == r.if_team_exact):
                     if_candidates.append(x[(n, if_sl)])
-
             if not if_candidates:
                 model.Add(g == 0)
             else:
                 s_if = sum(if_candidates)
                 model.Add(s_if >= g)
-                model.Add(s_if <= 1)  # that slot takes exactly one player anyway
-
-            # THEN: require at least K helpers from desired scope
+                model.Add(s_if <= 1)
             if r.team_scope == "any":
                 pool = [y[n] for n in names if by_name[n].pos in want_from_pos]
                 if pool:
                     model.Add(sum(pool) >= r.then_at_least * g)
-
             elif r.team_scope == "exact_team" and r.team_exact:
                 pool = [y[n] for n in names if (by_name[n].team == r.team_exact and by_name[n].pos in want_from_pos)]
                 if pool:
                     model.Add(sum(pool) >= r.then_at_least * g)
-
             else:
-                # same_team / opp_team: we need to key off who sits in if_sl
                 for n in names:
                     p = by_name[n]
                     if p.pos not in want_if_pos:
                         continue
                     if r.if_team_exact and p.team != r.if_team_exact:
                         continue
-
-                    is_this = x[(n, if_sl)]  # 1 iff this specific player is the IF
+                    is_this = x[(n, if_sl)]
                     helper_vars: List[cp_model.IntVar] = []
                     if r.team_scope == "same_team":
                         for m in names:
@@ -1075,7 +1054,6 @@ def _sd_solve_one(
                     if helper_vars:
                         model.Add(sum(helper_vars) >= r.then_at_least * is_this)
 
-    # OBJECTIVE (slot-aware)
     model.Maximize(
         sum(
             int(_sd_metric_for_slot(by_name[n], id_to_label[sl], req.objective) * 1000) * x[(n, sl)]
@@ -1096,7 +1074,6 @@ def _sd_solve_one(
     if len(chosen) != len(set(chosen)) or len(chosen) != len(slot_ids):
         return None
 
-    # build slot_map (unique ids) and compute slot-aware totals
     slot_map: Dict[str, str] = {}
     for sl in slot_ids:
         for n in names:
@@ -1119,53 +1096,39 @@ def _sd_scores(req: SDSolveRequest) -> Dict[str, float]:
 
 @app.post("/solve_showdown_stream")
 def solve_showdown_stream(req: SDSolveRequest):
-    """
-    SSE endpoint for the React Showdown optimizer.
-    Emits: {index, drivers:[names], salary, total} per lineup, then a 'done' event.
-    """
     random.seed()
-
     used_player_counts: Dict[str, int] = {}
     used_tag_counts: Dict[str, int] = {}
     player_caps = _sd_player_caps(req)
     tag_caps    = _sd_player_caps_tag(req)
-
     prior: List[List[str]] = []
 
     def gen():
         produced = 0
         for i in range(req.n):
             scores = _sd_scores(req)
-
-            # chase per-tag mins first, then per-player mins
             need_tag = _sd_min_need_tag(req, used_tag_counts)
             forced = need_tag or _sd_min_need_player(req, used_player_counts)
-
             ans = _sd_solve_one(req, scores, used_player_counts, player_caps,
                                 forced, prior, used_tag_counts, tag_caps)
             if not ans:
                 yield sse_event({"done": True, "reason": "no_more_unique_or_exposure_capped", "produced": produced})
                 return
-
             chosen, salary, total, slot_map = ans
-
-            # update exposures
             for n in chosen:
                 used_player_counts[n] = used_player_counts.get(n, 0) + 1
             for sl, n in (slot_map or {}).items():
                 key = f"{n}::{sl}"
                 used_tag_counts[key] = used_tag_counts.get(key, 0) + 1
-
             prior.append(chosen)
             produced += 1
-
+            ordered = _sd_ordered_players(slot_map)
             yield sse_event({
                 "index": i + 1,
-                "drivers": sorted(chosen),
+                "drivers": ordered,
                 "salary": salary,
                 "total": total,
             })
-
         yield sse_event({"done": True, "produced": produced})
 
     return StreamingResponse(
@@ -1173,7 +1136,6 @@ def solve_showdown_stream(req: SDSolveRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
-
 @app.post("/solve_showdown")
 def solve_showdown(req: SDSolveRequest):
     """
@@ -1208,7 +1170,8 @@ def solve_showdown(req: SDSolveRequest):
             used_tag_counts[key] = used_tag_counts.get(key, 0) + 1
 
         prior.append(chosen)
-        out.append({"drivers": sorted(chosen), "salary": salary, "total": total})
+        ordered = _sd_ordered_players(slot_map)
+        out.append({"drivers": ordered, "salary": salary, "total": total})
 
     return {"lineups": out, "produced": len(out)}
 # ========================== END SHOWDOWN SOLVER ==========================
