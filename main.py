@@ -723,125 +723,121 @@ def solve_nfl(req: SolveNFLRequest):
 
     return {"lineups": out, "produced": len(out)}
 
-# ================== NFL SHOWDOWN MODELS & SOLVER ==================
-# Drop-in replacement for your existing Showdown block.
+# ============================ SHOWDOWN SOLVER ============================
+# Self-contained block: paste at the end of main.py
 
-from typing import List, Dict, Optional, Tuple, Set, Literal, Any
-from pydantic import BaseModel, Field, validator
-from ortools.sat.python import cp_model
-import random
+from typing import List, Dict, Optional, Literal, Tuple, Set
+from pydantic import BaseModel, Field
 
-BasePos = Literal["QB", "RB", "WR", "TE", "DST", "K"]  # showdown supports K
+# ---- Models -------------------------------------------------------------
 
-class ShowdownSlot(BaseModel):
-    name: Literal["CPT","MVP","FLEX"]
-    eligible: List[BasePos]  # base positions only
+ShowPos = Literal["QB", "RB", "WR", "TE", "DST", "K"]
+ShowCap = Literal["CPT", "MVP", "FLEX"]  # UI uses CPT for DK, MVP for FD
 
-class ShowdownPlayer(BaseModel):
+class SDPlayer(BaseModel):
     name: str
-    pos: BasePos
+    pos: ShowPos
     team: str
     opp: str
-
-    # FLEX salary + metrics (always required)
     salary: int
     proj: float
-    floor: float = 0.0
-    ceil: float  = 0.0
-    pown: float  = 0.0   # 0..1
-    opt: float   = 0.0   # 0..1
+    floor: float
+    ceil: float
+    pown: float   # 0..1
+    opt: float    # 0..1
 
-    # Optional CPT/MVP overrides (if your feed provides them)
-    cap_salary: Optional[int] = None
-    cap_proj:    Optional[float] = None
-    cap_floor:   Optional[float] = None
-    cap_ceil:    Optional[float] = None
-    cap_pown:    Optional[float] = None
-    cap_opt:     Optional[float]  = None
+class SDSlot(BaseModel):
+    name: ShowCap
+    eligible: List[ShowPos]
 
-    # Normalize common alt position spellings from feeds (helps FD/DST etc.)
-    @validator("pos", pre=True)
-    def _norm_pos(cls, v):
-        s = str(v or "").upper().replace(" ", "")
-        if s in {"DEF", "D", "D/ST", "DST"}:
-            return "DST"
-        if s in {"PK"}:
-            return "K"
-        return s
+class SDIfThenRule(BaseModel):
+    # IF side
+    if_slot: ShowCap = "CPT"  # "CPT"|"MVP"|"FLEX"
+    if_pos: List[ShowPos] = Field(default_factory=lambda: ["QB"])
+    if_team_exact: Optional[str] = None  # e.g., "PHI" to fire only for that team
 
-class IfThenRule(BaseModel):
-    # Example: if CPT/MVP is QB then require at least 1 FLEX from {WR,TE}
-    # scope: 'same_team' or 'opp_team' or 'any'
-    if_tag: Literal["CPT","MVP"] = "CPT"
-    if_pos: List[BasePos] = Field(default_factory=lambda: ["QB"])
+    # THEN side
     then_at_least: int = 1
-    from_pos: List[BasePos] = Field(default_factory=lambda: ["WR","TE"])
-    team_scope: Literal["any","same_team","opp_team"] = "any"
+    from_pos: List[ShowPos] = Field(default_factory=lambda: ["WR", "TE"])
+    team_scope: Literal["same_team", "opp_team", "any", "exact_team"] = "same_team"
+    team_exact: Optional[str] = None  # used only if team_scope == "exact_team"
 
-class SolveShowdownRequest(BaseModel):
+class SDSolveRequest(BaseModel):
     site: Literal["dk","fd"]
-    # exactly 6 slots: 1 CPT/MVP + 5 FLEX
-    slots: List[ShowdownSlot]
-    players: List[ShowdownPlayer]
+    slots: List[SDSlot]
+    players: List[SDPlayer]
     n: int
     cap: int
     objective: Literal["proj","floor","ceil","pown","opt"] = "proj"
 
-    # controls
-    locks: List[str] = Field(default_factory=list)        # may include "::CPT"/"::FLEX"
-    excludes: List[str] = Field(default_factory=list)     # may include "::CPT"/"::FLEX"
-    boosts: Dict[str, int] = Field(default_factory=dict)  # +/- steps (3% per step)
+    locks: List[str] = Field(default_factory=list)       # player names (slot-agnostic)
+    excludes: List[str] = Field(default_factory=list)    # player names
+    boosts: Dict[str, int] = Field(default_factory=dict) # +/- steps, 1 step = 3%
     randomness: float = 0.0
     global_max_pct: float = 100.0
-    min_pct: Dict[str, float] = Field(default_factory=dict)
-    max_pct: Dict[str, float] = Field(default_factory=dict)
-    min_diff: int = 0
+    min_pct: Dict[str, float] = Field(default_factory=dict)   # per-player (both slots)
+    max_pct: Dict[str, float] = Field(default_factory=dict)   # per-player (both slots)
+
+    # NEW: per-slot exposure (keys "Name::CPT", "Name::MVP", "Name::FLEX1"...)
+    min_pct_tag: Dict[str, float] = Field(default_factory=dict)
+    max_pct_tag: Dict[str, float] = Field(default_factory=dict)
+
+    # Uniqueness vs prior lineups (Hamming). If your UI sends max_overlap, you can ignore it.
+    min_diff: int = 1
     time_limit_ms: int = 1500
 
-    # showdown specific
-    max_overlap: int = 5  # FLEX-name overlap limit vs prior lineups
+    # lineup-level pOWN% cap (sum of player pOWN% in percentage points, e.g., 200 = 200%)
     lineup_pown_max: Optional[float] = None
 
-    # IF→THEN rules
-    rules: List[IfThenRule] = Field(default_factory=list)
+    # Team caps across the run (optional, not strictly needed by UI; kept for parity)
+    team_max_pct: Dict[str, float] = Field(default_factory=dict)
 
-# ---------- helpers ----------
-def _sd_metric(p: ShowdownPlayer, tag: str, objective: str, mult: float) -> float:
-    """
-    Objective value for the player's tag (CPT/MVP vs FLEX).
-    If tag is captain, prefer cap_* fields when present; else multiply base by mult (1.5).
-    """
-    if tag in ("CPT","MVP"):
-        if objective == "proj" and p.cap_proj is not None:   return p.cap_proj
-        if objective == "floor" and p.cap_floor is not None: return p.cap_floor
-        if objective == "ceil" and p.cap_ceil is not None:   return p.cap_ceil
-        if objective == "pown" and p.cap_pown is not None:   return p.cap_pown * 100.0
-        if objective == "opt"  and p.cap_opt  is not None:   return p.cap_opt * 100.0
-        base = p.proj if objective=="proj" else p.floor if objective=="floor" else p.ceil if objective=="ceil" else (p.pown*100.0 if objective=="pown" else p.opt*100.0)
-        return base * mult
-    # FLEX
-    if objective == "proj":  return p.proj
+    # IF→THEN rules
+    rules: List[SDIfThenRule] = Field(default_factory=list)
+
+# ---- Helpers ------------------------------------------------------------
+
+def _sd_metric(p: SDPlayer, objective: str) -> float:
+    if objective == "proj": return p.proj
     if objective == "floor": return p.floor
     if objective == "ceil":  return p.ceil
     if objective == "pown":  return p.pown * 100.0
     if objective == "opt":   return p.opt * 100.0
     return p.proj
 
-def _sd_salary(p: ShowdownPlayer, tag: str, mult: float) -> int:
-    if tag in ("CPT","MVP"):
-        if p.cap_salary is not None:
-            return int(p.cap_salary)
-        return int(round(p.salary * mult))
-    return int(p.salary)
+def _sd_score(p: SDPlayer, objective: str, boost_steps: int, randomness_pct: float) -> float:
+    base = _sd_metric(p, objective)
+    boosted = base * (1.0 + 0.03 * (boost_steps or 0))
+    if randomness_pct > 0:
+        r = randomness_pct / 100.0
+        boosted *= (1.0 + random.uniform(-r, r))
+    return boosted
 
-def _caps_from_pct_sd(N: int, pct: float) -> int:
+def _sd_caps_from_pct(N: int, pct: float) -> int:
     return int(max(0.0, min(100.0, pct)) / 100.0 * N)
 
-def _min_need_player_sd(req: SolveShowdownRequest, counts: Dict[str, int]) -> Optional[str]:
+def _sd_player_caps(req: SDSolveRequest) -> Dict[str, int]:
+    N = max(1, int(req.n))
+    gcap = _sd_caps_from_pct(N, req.global_max_pct)
+    caps: Dict[str, int] = {}
+    for p in req.players:
+        per = _sd_caps_from_pct(N, req.max_pct.get(p.name, 100.0))
+        caps[p.name] = min(per, gcap) if gcap > 0 else 0
+    return caps
+
+def _sd_player_caps_tag(req: SDSolveRequest) -> Dict[str, int]:
+    N = max(1, int(req.n))
+    gcap = _sd_caps_from_pct(N, req.global_max_pct)
+    out: Dict[str, int] = {}
+    for key, pct in (req.max_pct_tag or {}).items():
+        out[key] = min(_sd_caps_from_pct(N, pct), gcap) if gcap > 0 else 0
+    return out
+
+def _sd_min_need_player(req: SDSolveRequest, counts: Dict[str, int]) -> Optional[str]:
     needs = []
     N = max(1, int(req.n))
     for p in req.players:
-        need = _caps_from_pct_sd(N, req.min_pct.get(p.name, 0.0))
+        need = _sd_caps_from_pct(N, req.min_pct.get(p.name, 0.0))
         if counts.get(p.name, 0) < need:
             needs.append(p)
     if not needs:
@@ -849,191 +845,204 @@ def _min_need_player_sd(req: SolveShowdownRequest, counts: Dict[str, int]) -> Op
     needs.sort(key=lambda r: r.proj, reverse=True)
     return needs[0].name
 
-def _player_caps_sd(req: SolveShowdownRequest) -> Dict[str, int]:
+def _sd_min_need_tag(req: SDSolveRequest, counts_tag: Dict[str, int]) -> Optional[str]:
     N = max(1, int(req.n))
-    gcap = _caps_from_pct_sd(N, req.global_max_pct)
-    caps = {}
-    for p in req.players:
-        per = _caps_from_pct_sd(N, req.max_pct.get(p.name, 100.0))
-        caps[p.name] = min(per, gcap) if gcap > 0 else 0
-    return caps
+    needs: List[Tuple[str,float]] = []
+    for key, pct in (req.min_pct_tag or {}).items():
+        need = _sd_caps_from_pct(N, pct)
+        if counts_tag.get(key, 0) < need:
+            # rank by that player's proj (best effort)
+            try:
+                nm, _sl = key.rsplit("::", 1)
+            except ValueError:
+                continue
+            for p in req.players:
+                if p.name == nm:
+                    needs.append((key, p.proj))
+                    break
+    if not needs:
+        return None
+    needs.sort(key=lambda t: t[1], reverse=True)
+    return needs[0][0]
 
-def _team_to_opp_map_sd(players: List[ShowdownPlayer]) -> Dict[str, Set[str]]:
+def _sd_team_to_opp_map(players: List[SDPlayer]) -> Dict[str, Set[str]]:
     m: Dict[str, Set[str]] = {}
     for p in players:
         if p.team and p.opp:
             m.setdefault(p.team, set()).add(p.opp)
     return m
 
-def _scores_for_iteration_sd(req: SolveShowdownRequest, cap_mult: float):
-    # score[(name,tag)] for tag in {"CPT","FLEX"}
-    scores: Dict[Tuple[str,str], float] = {}
-    base_for_order: Dict[str, float] = {}
-    for p in req.players:
-        boost = (req.boosts or {}).get(p.name, 0)
-        for tag in ("CPT", "FLEX"):
-            base = _sd_metric(p, "CPT", req.objective, cap_mult) if tag == "CPT" else _sd_metric(p, "FLEX", req.objective, cap_mult)
-            boosted = base * (1.0 + 0.03 * boost)
-            if req.randomness > 0:
-                r = req.randomness / 100.0
-                boosted *= (1.0 + random.uniform(-r, r))
-            scores[(p.name, tag)] = boosted
-        base_for_order[p.name] = _sd_metric(p, "FLEX", req.objective, cap_mult)
-    return scores, base_for_order
+# ---- Core solver --------------------------------------------------------
 
-# ---------- core solver ----------
-def _solve_one_showdown(
-    req: SolveShowdownRequest,
-    scores: Dict[Tuple[str,str], float],
+def _sd_solve_one(
+    req: SDSolveRequest,
+    scores: Dict[str, float],
     used_player_counts: Dict[str, int],
     player_caps: Dict[str, int],
     forced_include: Optional[str],
-    prior_lineups: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-
-    cap_mult = 1.5  # DK & FD both 1.5x
+    prior_lineups: List[List[str]],
+    # per-slot exposure
+    used_tag_counts: Dict[str, int],
+    tag_caps: Dict[str, int],
+) -> Optional[Tuple[List[str], int, float, Dict[str, str]]]:
+    """
+    Returns (chosen_names, salary, total_metric, slot_map)
+    slot_map: {slotId -> playerName}, where slotId is guaranteed unique (CPT/MVP, FLEX1..).
+    """
     model = cp_model.CpModel()
 
-    by_name: Dict[str, ShowdownPlayer] = {p.name: p for p in req.players}
+    # uniquify slot ids (FLEX may repeat from UI)
+    slot_labels = [s.name for s in req.slots]
+    slot_ids: List[str] = []
+    seen: Dict[str, int] = {}
+    for lbl in slot_labels:
+        if lbl in ("FLEX",):
+            seen[lbl] = seen.get(lbl, 0) + 1
+            slot_ids.append(f"{lbl}{seen[lbl]}")
+        else:
+            # "CPT" or "MVP" should be unique already
+            slot_ids.append(lbl)
+
+    by_name: Dict[str, SDPlayer] = {p.name: p for p in req.players}
     names = list(by_name.keys())
 
-    # Which base positions are allowed in CPT and FLEX from the provided slots
-    cap_eligible: Set[BasePos] = set()
-    flex_eligible: Set[BasePos] = set()
-    found_cap = False
-    for s in req.slots:
-        if s.name in ("CPT","MVP") and not found_cap:
-            cap_eligible.update(s.eligible)
-            found_cap = True
-        else:
-            flex_eligible.update(s.eligible)
-    if not cap_eligible: cap_eligible = {"QB","RB","WR","TE","DST","K"}
-    if not flex_eligible: flex_eligible = {"QB","RB","WR","TE","DST","K"}
-
-    cap  = {n: model.NewBoolVar(f"cap_{n}")  for n in names}
-    flex = {n: model.NewBoolVar(f"flex_{n}") for n in names}
-    chosen_any = {n: model.NewBoolVar(f"any_{n}") for n in names}
-
+    # decision vars: x[name, slotId] in {0,1}
+    x: Dict[Tuple[str,str], cp_model.IntVar] = {}
     for n in names:
-        model.Add(chosen_any[n] == cap[n] + flex[n])
-        model.Add(cap[n] + flex[n] <= 1)
+        for sl in slot_ids:
+            x[(n, sl)] = model.NewBoolVar(f"sd_x_{n}_{sl}")
 
-    # roster
-    model.Add(sum(cap[n] for n in names) == 1)
-    model.Add(sum(flex[n] for n in names) == 5)
-
-    # eligibility
+    # helper y[name] = chosen in any slot
+    y: Dict[str, cp_model.IntVar] = {}
     for n in names:
-        if by_name[n].pos not in cap_eligible: model.Add(cap[n] == 0)
-        if by_name[n].pos not in flex_eligible: model.Add(flex[n] == 0)
+        var = model.NewBoolVar(f"sd_y_{n}")
+        y[n] = var
+        model.Add(sum(x[(n, sl)] for sl in slot_ids) == var)
+
+    # slot fill: exactly 1 per slot; also enforce eligibility
+    for sl, slot in zip(slot_ids, req.slots):
+        for n in names:
+            if by_name[n].pos not in set(slot.eligible):
+                model.Add(x[(n, sl)] == 0)
+        model.Add(sum(x[(n, sl)] for n in names) == 1)
+
+    # each player at most 1 slot (already via y==sum x)
+    for n in names:
+        model.Add(sum(x[(n, sl)] for sl in slot_ids) <= 1)
 
     # salary cap
-    model.Add(
-        sum(cap[n] * _sd_salary(by_name[n], "CPT", cap_mult) +
-            flex[n] * _sd_salary(by_name[n], "FLEX", cap_mult) for n in names)
-        <= req.cap
-    )
+    model.Add(sum(y[n] * by_name[n].salary for n in names) <= req.cap)
 
-    # locks/excludes (support "Name::CPT"/"Name::FLEX")
-    excl_set = set(req.excludes or [])
-    lock_set = set(req.locks or [])
-    def want(name: str, tag: str) -> bool:
-        key = f"{name}::{tag}"
-        return key in lock_set or (name in lock_set and tag in ("CPT", "FLEX"))
-    def ban(name: str, tag: str) -> bool:
-        key = f"{name}::{tag}"
-        return key in excl_set or (name in excl_set and tag in ("CPT", "FLEX"))
-
+    # locks / excludes
+    excl = set(req.excludes or [])
+    lock = set(req.locks or [])
     for n in names:
-        if want(n, "CPT"):  model.Add(cap[n] == 1)
-        if want(n, "FLEX"): model.Add(flex[n] == 1)
-        if ban(n, "CPT"):   model.Add(cap[n] == 0)
-        if ban(n, "FLEX"):  model.Add(flex[n] == 0)
+        if n in excl:
+            model.Add(y[n] == 0)
+        if n in lock:
+            model.Add(y[n] == 1)
 
-    # exposure caps across run
+    # per-player exposure caps (across run)
     for n in names:
         if used_player_counts.get(n, 0) >= player_caps.get(n, 10**9):
-            model.Add(cap[n] == 0); model.Add(flex[n] == 0)
+            model.Add(y[n] == 0)
 
-    # forced include to hit min%
-    if forced_include and forced_include in by_name:
-        model.Add(chosen_any[forced_include] == 1)
+    # per-tag (player::slot) exposure caps (across run)
+    for n in names:
+        for sl in slot_ids:
+            key = f"{n}::{sl}"
+            if used_tag_counts.get(key, 0) >= tag_caps.get(key, 10**9):
+                model.Add(x[(n, sl)] == 0)
 
-    # IF→THEN rules (gate on captain position/team)
-    cap_pos_is: Dict[BasePos, cp_model.IntVar] = {}
-    for pos in ("QB","RB","WR","TE","DST","K"):
-        v = model.NewBoolVar(f"cap_is_{pos}")
-        cap_pos_is[pos] = v
-        model.Add(sum(cap[n] for n in names if by_name[n].pos == pos) == v)
+    # forced include to chase mins (tag-priority)
+    if forced_include:
+        if "::" in forced_include:
+            nm, sl = forced_include.split("::", 1)
+            if (nm in names) and (sl in slot_ids):
+                model.Add(x[(nm, sl)] == 1)
+        elif forced_include in y:
+            model.Add(y[forced_include] == 1)
 
-    all_teams = sorted({by_name[n].team for n in names if by_name[n].team})
-    cap_team_is: Dict[str, cp_model.IntVar] = {}
-    for t in all_teams:
-        v = model.NewBoolVar(f"cap_team_{t}")
-        cap_team_is[t] = v
-        model.Add(sum(cap[n] for n in names if by_name[n].team == t) == v)
+    # min_diff (Hamming) vs prior lineups
+    roster_size = len(slot_ids)
+    for lineup in prior_lineups:
+        model.Add(sum(y[n] for n in lineup if n in y) <= roster_size - max(1, req.min_diff))
 
-    team_to_opp = _team_to_opp_map_sd(req.players)
-
-    for rule in (req.rules or []):
-        gate = model.NewBoolVar("rule_gate")
-        model.Add(sum(cap_pos_is.get(pos, 0) for pos in rule.if_pos) >= 1).OnlyEnforceIf(gate)
-        model.Add(sum(cap_pos_is.get(pos, 0) for pos in rule.if_pos) == 0).OnlyEnforceIf(gate.Not())
-
-        def flex_vars_for_team_scope(scope: str, team: Optional[str] = None):
-            if scope == "any" or not team:
-                return [flex[n] for n in names if by_name[n].pos in rule.from_pos]
-            if scope == "same_team":
-                return [flex[n] for n in names if by_name[n].pos in rule.from_pos and by_name[n].team == team]
-            if scope == "opp_team":
-                opps = team_to_opp.get(team, set())
-                return [flex[n] for n in names if by_name[n].pos in rule.from_pos and by_name[n].team in opps]
-            return []
-
-        if rule.team_scope == "any":
-            vec = [flex[n] for n in names if by_name[n].pos in rule.from_pos]
-            if vec:
-                model.Add(sum(vec) >= rule.then_at_least).OnlyEnforceIf(gate)
-        else:
-            for t in all_teams:
-                vec = flex_vars_for_team_scope(rule.team_scope, t)
-                if not vec:
-                    continue
-                need = model.NewIntVar(0, 5, f"rule_need_{t}")
-                model.Add(need == rule.then_at_least * cap_team_is[t])
-                model.Add(sum(vec) >= need).OnlyEnforceIf(gate)
-
-    # lineup pOWN cap (sum of tag-specific pOWN %, rounded to int)
+    # lineup pOWN% cap (sum of percentage points)
     if isinstance(req.lineup_pown_max, (int, float)) and req.lineup_pown_max is not None:
-        lhs = sum(
-            int(round((by_name[n].cap_pown if by_name[n].cap_pown is not None else by_name[n].pown * 1.5) * 100)) * cap[n]
-            + int(round(by_name[n].pown * 100)) * flex[n]
-            for n in names
-        )
+        lhs = sum(int(round(by_name[n].pown * 100)) * y[n] for n in names)
         model.Add(lhs <= int(round(req.lineup_pown_max)))
 
-    # ---- PREVENT EXACT DUPLICATES ----
-    # Keep your existing "max_overlap" rule (FLEX-only), and also forbid a lineup
-    # that matches both the previous CPT and all 5 FLEX exactly.
-    for prev in prior_lineups:
-        prev_cap = prev.get("cap", "")
-        prev_flex = set(prev.get("flex", []))
-        if prev_flex:
-            # FLEX overlap limit
-            model.Add(sum(flex[n] for n in names if n in prev_flex) <= max(0, int(req.max_overlap)))
-        if prev_cap:
-            # If CPT is same AND all five FLEX are the same -> would sum to 6; forbid that:
-            model.Add(
-                (cap[prev_cap] if prev_cap in cap else 0)
-                + sum(flex[n] for n in names if n in prev_flex)
-                <= 5
-            )
+    # IF→THEN rules (slot/team aware)
+    opp_map = _sd_team_to_opp_map(req.players)
+    # quick map: for each slotId, what label did the request have (CPT/MVP/FLEX)
+    id_to_label = {sl: lbl for sl, lbl in zip(slot_ids, slot_labels)}
+
+    for ridx, r in enumerate(req.rules or []):
+        # match the "if_slot" to the actual unique slotId(s) with that label
+        if_slot_ids = [sl for sl in slot_ids if id_to_label[sl] == r.if_slot]
+        if not if_slot_ids:
+            continue
+
+        want_if_pos = set(r.if_pos)
+        want_from_pos = set(r.from_pos)
+
+        for if_sl in if_slot_ids:
+            # gate var for this IF slot instance
+            g = model.NewBoolVar(f"sd_rule_{ridx}_gate_{if_sl}")
+
+            # g turns on iff some candidate (pos + optional team) is in that slot
+            if_candidates = []
+            for n in names:
+                p = by_name[n]
+                if p.pos in want_if_pos and (not r.if_team_exact or p.team == r.if_team_exact):
+                    if_candidates.append(x[(n, if_sl)])
+
+            if not if_candidates:
+                model.Add(g == 0)
+            else:
+                s_if = sum(if_candidates)
+                model.Add(s_if >= g)
+                model.Add(s_if <= 1)  # that slot takes exactly one player anyway
+
+            # THEN: require at least K helpers from desired scope
+            if r.team_scope == "any":
+                pool = [y[n] for n in names if by_name[n].pos in want_from_pos]
+                if pool:
+                    model.Add(sum(pool) >= r.then_at_least * g)
+
+            elif r.team_scope == "exact_team" and r.team_exact:
+                pool = [y[n] for n in names if (by_name[n].team == r.team_exact and by_name[n].pos in want_from_pos)]
+                if pool:
+                    model.Add(sum(pool) >= r.then_at_least * g)
+
+            else:
+                # same_team / opp_team: we need to key off who sits in if_sl
+                for n in names:
+                    p = by_name[n]
+                    if p.pos not in want_if_pos:
+                        continue
+                    if r.if_team_exact and p.team != r.if_team_exact:
+                        continue
+
+                    is_this = x[(n, if_sl)]  # 1 iff this specific player is the IF
+                    helper_vars: List[cp_model.IntVar] = []
+                    if r.team_scope == "same_team":
+                        for m in names:
+                            q = by_name[m]
+                            if q.team == p.team and q.pos in want_from_pos:
+                                helper_vars.append(y[m])
+                    elif r.team_scope == "opp_team":
+                        opps = opp_map.get(p.team, set())
+                        for m in names:
+                            q = by_name[m]
+                            if q.team in opps and q.pos in want_from_pos:
+                                helper_vars.append(y[m])
+                    if helper_vars:
+                        model.Add(sum(helper_vars) >= r.then_at_least * is_this)
 
     # objective
-    model.Maximize(
-        sum(int(scores[(n, "CPT")]  * 1000) * cap[n]  for n in names) +
-        sum(int(scores[(n, "FLEX")] * 1000) * flex[n] for n in names)
-    )
+    model.Maximize(sum(int(scores[n] * 1000) * y[n] for n in names))
 
     solver = cp_model.CpSolver()
     if req.time_limit_ms and req.time_limit_ms > 0:
@@ -1044,54 +1053,80 @@ def _solve_one_showdown(
     if res != cp_model.OPTIMAL and res != cp_model.FEASIBLE:
         return None
 
-    cap_name = next((n for n in names if solver.Value(cap[n]) == 1), "")
-    flex_names = [n for n in names if solver.Value(flex[n]) == 1]
-    if not cap_name or len(flex_names) != 5:
+    chosen = [n for n in names if solver.Value(y[n]) == 1]
+    if len(chosen) != len(set(chosen)) or len(chosen) != len(slot_ids):
         return None
 
-    total_salary = sum(
-        _sd_salary(by_name[n], "CPT", cap_mult) if n == cap_name else _sd_salary(by_name[n], "FLEX", cap_mult)
-        for n in [cap_name] + flex_names
-    )
-    total_metric = sum(
-        _sd_metric(by_name[n], "CPT", req.objective, cap_mult) if n == cap_name else _sd_metric(by_name[n], "FLEX", req.objective, cap_mult)
-        for n in [cap_name] + flex_names
-    )
-    return {"cap": cap_name, "flex": flex_names, "salary": total_salary, "total": total_metric}
+    salary = sum(by_name[n].salary for n in chosen)
+    total  = sum(_sd_metric(by_name[n], req.objective) for n in chosen)
 
-# ---------- endpoints ----------
+    # build slot_map (unique ids)
+    slot_map: Dict[str, str] = {}
+    for sl in slot_ids:
+        for n in names:
+            if solver.Value(x[(n, sl)]) == 1:
+                slot_map[sl] = n
+                break
+
+    return chosen, salary, total, slot_map
+
+# ---- Endpoints ----------------------------------------------------------
+
+def _sd_scores(req: SDSolveRequest) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for p in req.players:
+        out[p.name] = _sd_score(p, req.objective, (req.boosts or {}).get(p.name, 0), req.randomness)
+    return out
+
 @app.post("/solve_showdown_stream")
-def solve_showdown_stream(req: SolveShowdownRequest):
+def solve_showdown_stream(req: SDSolveRequest):
+    """
+    SSE endpoint for the React Showdown optimizer.
+    Emits: {index, drivers:[names], salary, total} per lineup, then a 'done' event.
+    """
     random.seed()
+
     used_player_counts: Dict[str, int] = {}
-    player_caps = _player_caps_sd(req)
-    prior: List[Dict[str, Any]] = []
+    used_tag_counts: Dict[str, int] = {}
+    player_caps = _sd_player_caps(req)
+    tag_caps    = _sd_player_caps_tag(req)
+
+    prior: List[List[str]] = []
 
     def gen():
         produced = 0
         for i in range(req.n):
-            scores, _ = _scores_for_iteration_sd(req, cap_mult=1.5)
-            include = _min_need_player_sd(req, used_player_counts)
-            ans = _solve_one_showdown(req, scores, used_player_counts, player_caps, include, prior)
+            scores = _sd_scores(req)
+
+            # chase per-tag mins first, then per-player mins
+            need_tag = _sd_min_need_tag(req, used_tag_counts)
+            forced = need_tag or _sd_min_need_player(req, used_player_counts)
+
+            ans = _sd_solve_one(req, scores, used_player_counts, player_caps,
+                                forced, prior, used_tag_counts, tag_caps)
             if not ans:
                 yield sse_event({"done": True, "reason": "no_more_unique_or_exposure_capped", "produced": produced})
                 return
 
-            cap_name = ans["cap"]; flex_names = ans["flex"]
-            # update exposures
-            for n in [cap_name] + flex_names:
-                used_player_counts[n] = used_player_counts.get(n, 0) + 1
+            chosen, salary, total, slot_map = ans
 
-            # remember for duplicate prevention & overlap rules
-            prior.append({"cap": cap_name, "flex": flex_names})
+            # update exposures
+            for n in chosen:
+                used_player_counts[n] = used_player_counts.get(n, 0) + 1
+            for sl, n in (slot_map or {}).items():
+                key = f"{n}::{sl}"
+                used_tag_counts[key] = used_tag_counts.get(key, 0) + 1
+
+            prior.append(chosen)
             produced += 1
 
             yield sse_event({
                 "index": i + 1,
-                "drivers": [cap_name] + flex_names,  # first is CPT/MVP for UI
-                "salary": ans["salary"],
-                "total": ans["total"],
+                "drivers": sorted(chosen),
+                "salary": salary,
+                "total": total,
             })
+
         yield sse_event({"done": True, "produced": produced})
 
     return StreamingResponse(
@@ -1101,23 +1136,41 @@ def solve_showdown_stream(req: SolveShowdownRequest):
     )
 
 @app.post("/solve_showdown")
-def solve_showdown(req: SolveShowdownRequest):
+def solve_showdown(req: SDSolveRequest):
+    """
+    Batch variant (returns all lineups in one JSON).
+    """
     random.seed()
+
     used_player_counts: Dict[str, int] = {}
-    player_caps = _player_caps_sd(req)
-    prior: List[Dict[str, Any]] = []
+    used_tag_counts: Dict[str, int] = {}
+    player_caps = _sd_player_caps(req)
+    tag_caps    = _sd_player_caps_tag(req)
+
+    prior: List[List[str]] = []
     out = []
+
     for _ in range(req.n):
-        scores, _ = _scores_for_iteration_sd(req, cap_mult=1.5)
-        include = _min_need_player_sd(req, used_player_counts)
-        ans = _solve_one_showdown(req, scores, used_player_counts, player_caps, include, prior)
+        scores = _sd_scores(req)
+        need_tag = _sd_min_need_tag(req, used_tag_counts)
+        forced = need_tag or _sd_min_need_player(req, used_player_counts)
+
+        ans = _sd_solve_one(req, scores, used_player_counts, player_caps,
+                            forced, prior, used_tag_counts, tag_caps)
         if not ans:
             break
-        cap_name = ans["cap"]; flex_names = ans["flex"]
-        for n in [cap_name] + flex_names:
+
+        chosen, salary, total, slot_map = ans
+
+        for n in chosen:
             used_player_counts[n] = used_player_counts.get(n, 0) + 1
-        prior.append({"cap": cap_name, "flex": flex_names})
-        out.append({"drivers": [cap_name] + flex_names, "salary": ans["salary"], "total": ans["total"]})
+        for sl, n in (slot_map or {}).items():
+            key = f"{n}::{sl}"
+            used_tag_counts[key] = used_tag_counts.get(key, 0) + 1
+
+        prior.append(chosen)
+        out.append({"drivers": sorted(chosen), "salary": salary, "total": total})
+
     return {"lineups": out, "produced": len(out)}
 
 # === MLB MODELS & SOLVER — DROP-IN (stack teams + pitchers kept) ===
