@@ -1113,3 +1113,278 @@ def solve_showdown(req: SolveShowdownRequest):
         prior.append({"cap": cap_name, "flex": flex_names})
         out.append({"drivers": [cap_name] + flex_names, "salary": ans["salary"], "total": ans["total"]})
     return {"lineups": out, "produced": len(out)}
+
+# === MLB MODELS & SOLVER (paste below your imports; keep NFL code intact) ===
+import random
+from typing import Optional, Literal
+from pydantic import BaseModel, Field
+from fastapi.responses import StreamingResponse
+from ortools.sat.python import cp_model
+
+# NOTE: This assumes you already have a helper like `sse_event(payload: dict) -> str`
+# If not, add:
+# def sse_event(payload: dict) -> str:
+#     return f"data: {json.dumps(payload)}\n\n"
+
+class MLBPlayer(BaseModel):
+    name: str
+    team: str
+    opp: str
+    eligible: list[str]  # e.g., ["1B","OF"] or ["P"]
+    salary: int
+    proj: float
+    floor: float
+    ceil: float
+    pown: float  # 0..1
+    opt: float   # 0..1
+
+class MLBSslot(BaseModel):
+    name: str
+    eligible: list[str]
+
+class SolveMLBRequest(BaseModel):
+    site: Literal["dk","fd"]
+    slots: list[MLBSslot]
+    players: list[MLBPlayer]
+    n: int
+    cap: int
+    objective: Literal["proj","floor","ceil","pown","opt"] = "proj"
+
+    locks: list[str] = Field(default_factory=list)
+    excludes: list[str] = Field(default_factory=list)
+    boosts: dict[str,int] = Field(default_factory=dict)
+    randomness: float = 0.0
+    global_max_pct: float = 100.0
+    min_pct: dict[str,float] = Field(default_factory=dict)
+    max_pct: dict[str,float] = Field(default_factory=dict)
+    min_diff: int = 1
+    time_limit_ms: int = 1500
+
+    primary_stack_size: int = 5
+    secondary_stack_size: int = 3
+    avoid_hitters_vs_opp_pitcher: bool = True
+    max_hitters_vs_opp_pitcher: int = 0
+    lineup_pown_max: Optional[float] = None
+
+
+def _mlb_metric(p: MLBPlayer, objective: str) -> float:
+    if objective == "proj": return p.proj
+    if objective == "floor": return p.floor
+    if objective == "ceil": return p.ceil
+    if objective == "pown": return p.pown * 100.0
+    if objective == "opt":  return p.opt  * 100.0
+    return p.proj
+
+
+def _mlb_score(p: MLBPlayer, objective: str, boost_steps: int, randomness_pct: float) -> float:
+    base = _mlb_metric(p, objective)
+    boosted = base * (1.0 + 0.03 * (boost_steps or 0))
+    if randomness_pct > 0.0:
+        r = randomness_pct / 100.0
+        boosted *= (1.0 + random.uniform(-r, r))
+    return boosted
+
+
+def _solve_one_mlb(req: SolveMLBRequest, scores: dict[str,float], used: dict[str,int], caps: dict[str,int],
+                   forced_include: Optional[str], prior_lineups: list[list[str]]):
+    model = cp_model.CpModel()
+
+    by_name: dict[str, MLBPlayer] = {p.name: p for p in req.players}
+    names = list(by_name.keys())
+    slot_names = [s.name for s in req.slots]
+
+    # decision vars
+    x: dict[tuple[str,str], cp_model.IntVar] = {}
+    for n in names:
+        for sl in slot_names:
+            x[(n, sl)] = model.NewBoolVar(f"x_{n}_{sl}")
+    y: dict[str, cp_model.IntVar] = {n: model.NewBoolVar(f"y_{n}") for n in names}
+    for n in names:
+        model.Add(sum(x[(n, sl)] for sl in slot_names) == y[n])
+
+    # slot fill & eligibility
+    for sl, slot in zip(slot_names, req.slots):
+        for n in names:
+            elig = set(by_name[n].eligible or [])
+            slot_ok = any(p in slot.eligible for p in elig)
+            if not slot_ok:
+                model.Add(x[(n, sl)] == 0)
+        model.Add(sum(x[(n, sl)] for n in names) == 1)
+
+    # at most 1 slot per player
+    for n in names:
+        model.Add(sum(x[(n, sl)] for sl in slot_names) <= 1)
+
+    # salary cap
+    model.Add(sum(y[n] * by_name[n].salary for n in names) <= req.cap)
+
+    # locks/excludes
+    for n in names:
+        if n in (req.excludes or []):
+            model.Add(y[n] == 0)
+        if n in (req.locks or []):
+            model.Add(y[n] == 1)
+
+    # exposure caps already hit
+    for n in names:
+        if used.get(n,0) >= caps.get(n,10**9):
+            model.Add(y[n] == 0)
+
+    # min exposure steering
+    if forced_include and forced_include in y:
+        model.Add(y[forced_include] == 1)
+
+    # lineup uniqueness
+    roster_size = len(req.slots)
+    for lineup in prior_lineups:
+        model.Add(sum(y[n] for n in lineup if n in y) <= roster_size - max(1, req.min_diff))
+
+    # pitcher vs opposing hitters
+    hitters = [n for n in names if "P" not in set(by_name[n].eligible or [])]
+    pitchers = [n for n in names if "P" in set(by_name[n].eligible or [])]
+    if req.avoid_hitters_vs_opp_pitcher:
+        for p in pitchers:
+            opp_team = by_name[p].opp
+            opp_hitters = [n for n in hitters if by_name[n].team == opp_team]
+            if not opp_hitters: continue
+            M = len(hitters)
+            s = sum(y[n] for n in opp_hitters)
+            model.Add(s <= int(req.max_hitters_vs_opp_pitcher) + M * (1 - y[p]))
+
+    # stacking: require >= primary_stack_size hitters from one team
+    if req.primary_stack_size and req.primary_stack_size > 0:
+        teams = sorted({by_name[n].team for n in hitters})
+        M = len(hitters)
+        b_primary = {t: model.NewBoolVar(f"primary_{t}") for t in teams}
+        for t, v in b_primary.items():
+            team_hitters = [n for n in hitters if by_name[n].team == t]
+            s = sum(y[n] for n in team_hitters)
+            model.Add(s - req.primary_stack_size >= -M * (1 - v))
+            model.Add(s <= M * v)
+        model.Add(sum(b_primary.values()) >= 1)
+
+    # secondary stack from a different team
+    if req.secondary_stack_size and req.secondary_stack_size > 0:
+        teams = sorted({by_name[n].team for n in hitters})
+        M = len(hitters)
+        b_secondary = {t: model.NewBoolVar(f"secondary_{t}") for t in teams}
+        for t, v in b_secondary.items():
+            team_hitters = [n for n in hitters if by_name[n].team == t]
+            s = sum(y[n] for n in team_hitters)
+            model.Add(s - req.secondary_stack_size >= -M * (1 - v))
+            model.Add(s <= M * v)
+        # disjoint from primary
+        # map primary vars by team name if present
+        prim_map = {var.Name().split("_")[-1]: var for var in [*locals().get('b_primary', {}).values()]}
+        for t in teams:
+            pv = prim_map.get(t)
+            sv = b_secondary[t]
+            if pv is not None:
+                model.Add(pv + sv <= 1)
+        model.Add(sum(b_secondary.values()) >= 1)
+
+    # lineup pOWN cap (percentage points)
+    if isinstance(req.lineup_pown_max, (int,float)) and req.lineup_pown_max is not None:
+        lhs = sum(int(round(by_name[n].pown * 100)) * y[n] for n in names)
+        model.Add(lhs <= int(round(req.lineup_pown_max)))
+
+    # objective
+    model.Maximize(sum(int(scores[n] * 1000) * y[n] for n in names))
+
+    solver = cp_model.CpSolver()
+    if req.time_limit_ms and req.time_limit_ms > 0:
+        solver.parameters.max_time_in_seconds = req.time_limit_ms / 1000.0
+    solver.parameters.num_search_workers = 8
+
+    res = solver.Solve(model)
+    if res not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return None
+
+    chosen = [n for n in names if solver.Value(y[n]) == 1]
+    total = sum(_mlb_metric(by_name[n], req.objective) for n in chosen)
+    salary = sum(by_name[n].salary for n in chosen)
+    return chosen, salary, total
+
+
+def _cap_counts(req: SolveMLBRequest) -> dict[str,int]:
+    N = max(1, int(req.n))
+    gcap = int(min(max(req.global_max_pct, 0.0), 100.0) / 100.0 * N)
+    caps: dict[str,int] = {}
+    for p in req.players:
+        mp = req.max_pct.get(p.name, 100.0)
+        per = int(min(max(mp, 0.0), 100.0) / 100.0 * N)
+        caps[p.name] = min(per, gcap) if gcap > 0 else 0
+    return caps
+
+
+def _mins_needed(req: SolveMLBRequest, counts: dict[str,int]) -> Optional[str]:
+    needs = []
+    N = max(1, int(req.n))
+    for p in req.players:
+        need = int(min(max(req.min_pct.get(p.name, 0.0), 0.0), 100.0) / 100.0 * N)
+        if counts.get(p.name, 0) < need:
+            needs.append(p)
+    if not needs:
+        return None
+    needs.sort(key=lambda r: r.proj, reverse=True)
+    return needs[0].name
+
+
+@app.post("/solve_mlb_stream")
+def solve_mlb_stream(req: SolveMLBRequest):
+    random.seed()
+    counts: dict[str,int] = {}
+    prior: list[list[str]] = []
+    caps = _cap_counts(req)
+
+    def gen():
+        produced = 0
+        for i in range(req.n):
+            scores = {}
+            for p in req.players:
+                b = (req.boosts or {}).get(p.name, 0)
+                scores[p.name] = _mlb_score(p, req.objective, b, req.randomness)
+
+            include = _mins_needed(req, counts)
+            res = _solve_one_mlb(req, scores, counts, caps, include, prior)
+            if not res:
+                yield sse_event({"done": True, "reason": "no_more_unique_or_exposure_capped", "produced": produced})
+                return
+
+            chosen, salary, total = res
+            for n in chosen:
+                counts[n] = counts.get(n,0) + 1
+            prior.append(chosen)
+            produced += 1
+            yield sse_event({"index": i+1, "drivers": sorted(chosen), "salary": salary, "total": total})
+
+        yield sse_event({"done": True, "produced": produced})
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control":"no-cache","Connection":"keep-alive"})
+
+
+@app.post("/solve_mlb")
+def solve_mlb(req: SolveMLBRequest):
+    random.seed()
+    counts: dict[str,int] = {}
+    prior: list[list[str]] = []
+    caps = _cap_counts(req)
+    out = []
+
+    for _ in range(req.n):
+        scores = {}
+        for p in req.players:
+            b = (req.boosts or {}).get(p.name, 0)
+            scores[p.name] = _mlb_score(p, req.objective, b, req.randomness)
+
+        include = _mins_needed(req, counts)
+        res = _solve_one_mlb(req, scores, counts, caps, include, prior)
+        if not res:
+            break
+        chosen, salary, total = res
+        for n in chosen:
+            counts[n] = counts.get(n,0) + 1
+        prior.append(chosen)
+        out.append({"drivers": sorted(chosen), "salary": salary, "total": total})
+
+    return {"lineups": out, "produced": len(out)}
