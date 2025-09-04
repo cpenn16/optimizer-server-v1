@@ -989,14 +989,29 @@ def _sd_solve_one(
         if n in name_lock:
             model.Add(y[n] == 1)  # slot chosen by solver unless slot-locked below
 
-    # slot-tagged rules (normalize FLEX1/2/... -> FLEX; MVP/CPT pass through)
-    for n in names:
-        for sl in slot_ids:
-            tag = id_to_label[sl].upper()
-            if (n, tag) in slot_excl:
-                model.Add(x[(n, sl)] == 0)
-            if (n, tag) in slot_lock:
-                model.Add(x[(n, sl)] == 1)
+    # index tag -> engine slot ids
+    tag_to_slots: Dict[str, List[str]] = {}
+    for sl in slot_ids:
+        tag = id_to_label[sl].upper()  # FLEX1/2 -> FLEX; MVP/CPT passthrough
+        tag_to_slots.setdefault(tag, []).append(sl)
+
+    # slot-tagged excludes
+    for n, tag in slot_excl:
+        for sl in tag_to_slots.get(tag, []):
+            model.Add(x[(n, sl)] == 0)
+
+    # slot-tagged locks (single-slot: ==1; multi-slot like FLEX: exactly one)
+    for n, tag in slot_lock:
+        slots = tag_to_slots.get(tag, [])
+        if not slots:
+            continue
+        if len(slots) == 1:
+            model.Add(x[(n, slots[0])] == 1)
+        else:
+            model.Add(sum(x[(n, sl)] for sl in slots) == 1)  # exactly one FLEX*
+            for sl in slot_ids:                               # and forbid non-matching tags
+                if sl not in slots:
+                    model.Add(x[(n, sl)] == 0)
 
     # exposure caps already hit across the run
     for n in names:
@@ -1040,7 +1055,7 @@ def _sd_solve_one(
     # IF → THEN rules
     opp_map = _sd_team_to_opp_map(req.players)
     for ridx, r in enumerate(req.rules or []):
-        # FIX: make slot match case-insensitive so FD's "MVP" works like DK's "CPT"
+        # case-insensitive slot match so FD's MVP works
         if_slot_ids = [sl for sl in slot_ids if id_to_label[sl].upper() == str(r.if_slot).upper()]
         if not if_slot_ids:
             continue
@@ -1263,7 +1278,7 @@ class SolveMLBRequest(BaseModel):
     max_hitters_vs_opp_pitcher: int = 0    # when avoid_* True, cap opposing hitters count
     lineup_pown_max: Optional[float] = None  # sum of pOWN% across lineup, in percentage points
 
-    # 🔹 NEW: limit hitter pool & stack teams to this set (pitchers always allowed)
+    # 🔹 limit hitter pool & stack teams to this set (pitchers always allowed)
     allowed_teams: list[str] = Field(default_factory=list)
 
 # ----------------------------- helpers -----------------------------
@@ -1355,65 +1370,16 @@ def _solve_one_mlb(
     # salary cap
     model.Add(sum(y[n] * by_name[n].salary for n in names) <= req.cap)
 
-        # locks/excludes
-    # -------- slot-aware locks/excludes (works for DK: CPT/FLEX and FD: MVP/FLEX) ----------
-    excl_raw = set(req.excludes or [])
-    lock_raw = set(req.locks or [])
-
-    # Split into name-wide vs slot-tagged ("Name::CPT", "Name::FLEX", "Name::MVP")
-    name_excl = {k for k in excl_raw if "::" not in k}
-    name_lock = {k for k in lock_raw if "::" not in k}
-
-    slot_excl: set[tuple[str, str]] = set()
-    slot_lock: set[tuple[str, str]] = set()
-    for k in excl_raw:
-        if "::" in k:
-            nm, lab = k.split("::", 1)
-            slot_excl.add((nm, lab.upper()))
-    for k in lock_raw:
-        if "::" in k:
-            nm, lab = k.split("::", 1)
-            slot_lock.add((nm, lab.upper()))
-
-    # Name-wide first
+    # -------- locks/excludes (name-wide) ----------
+    excl = set(req.excludes or [])
+    lock = set(req.locks or [])
     for n in names:
-        if n in name_excl:
+        if n in excl:
             model.Add(y[n] == 0)
-            for sl in slot_ids:
+            for sl in slot_names:
                 model.Add(x[(n, sl)] == 0)
-        if n in name_lock:
-            model.Add(y[n] == 1)  # slot chosen by the solver unless also tag-locked below
-
-    # Build a quick index: tag ("CPT"/"MVP"/"FLEX") -> list of engine slot ids (e.g., ["FLEX1","FLEX2",...])
-    tag_to_slots: Dict[str, List[str]] = {}
-    for sl in slot_ids:
-        tag_to_slots.setdefault(id_to_label[sl].upper(), []).append(sl)
-
-    # Slot-tagged EXCLUDES: zero out all slots that carry that tag
-    for n, tag in slot_excl:
-        for sl in tag_to_slots.get(tag, []):
-            model.Add(x[(n, sl)] == 0)
-
-    # Slot-tagged LOCKS:
-    # - If the tag points to a single slot (CPT or MVP), set that x == 1 (what you had before).
-    # - If the tag points to multiple slots (FLEX1/2/...), require EXACTLY ONE of those to be 1,
-    #   and forbid all other slot tags for that player so they can't land in CPT/MVP instead.
-    for n, tag in slot_lock:
-        slots = tag_to_slots.get(tag, [])
-        if not slots:
-            continue
-        if len(slots) == 1:
-            model.Add(x[(n, slots[0])] == 1)
-        else:
-            # exactly one FLEX* slot
-            model.Add(sum(x[(n, sl)] for sl in slots) == 1)
-            # and forbid all non-matching slot tags (e.g., CPT/MVP) for this player
-            for sl in slot_ids:
-                if sl not in slots:
-                    model.Add(x[(n, sl)] == 0)
-
-    # --- end slot-aware locks/excludes ---
-
+        if n in lock:
+            model.Add(y[n] == 1)
 
     # exposure caps already hit across the run
     for n in names:
@@ -1474,7 +1440,6 @@ def _solve_one_mlb(
         model.Add(sum(b_primary.values()) == 1)
 
     # Secondary: at least secondary_stack_size hitters from exactly one team, different from primary
-    # Only create this constraint if there are enough distinct teams to support it
     if req.secondary_stack_size and req.secondary_stack_size > 0 and len(teams) >= (2 if b_primary else 1):
         b_secondary = {t: model.NewBoolVar(f"secondary_{t}") for t in teams}
         for t, v in b_secondary.items():
