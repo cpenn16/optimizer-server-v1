@@ -784,6 +784,7 @@ class SDSolveRequest(BaseModel):
     min_pct: Dict[str, float] = Field(default_factory=dict)
     max_pct: Dict[str, float] = Field(default_factory=dict)
 
+    # per-tag exposure controls: keys like "Name::CPT" / "Name::MVP" / "Name::FLEX"
     min_pct_tag: Dict[str, float] = Field(default_factory=dict)
     max_pct_tag: Dict[str, float] = Field(default_factory=dict)
 
@@ -906,6 +907,11 @@ def _sd_ordered_players(slot_map: Dict[str, str]) -> List[str]:
             order.append(slot_map[k])
     return order
 
+def _sd_canonical_label(slot_id: str) -> str:
+    """Map engine slot ids to canonical tag: FLEX1/2/... -> FLEX; MVP/CPT -> themselves."""
+    s = (slot_id or "").upper()
+    return "FLEX" if s.startswith("FLEX") else s
+
 # ---- Core solver --------------------------------------------------------
 
 def _sd_solve_one(
@@ -945,15 +951,18 @@ def _sd_solve_one(
         y[n] = var
         model.Add(sum(x[(n, sl)] for sl in slot_ids) == var)
 
+    # Fill each slot with exactly one eligible player
     for sl, slot in zip(slot_ids, req.slots):
         for n in names:
             if by_name[n].pos not in set(slot.eligible):
                 model.Add(x[(n, sl)] == 0)
         model.Add(sum(x[(n, sl)] for n in names) == 1)
 
+    # Each player at most one slot
     for n in names:
         model.Add(sum(x[(n, sl)] for sl in slot_ids) <= 1)
 
+    # Salary cap (MVP/CPT use slot-adjusted salary)
     model.Add(
         sum(
             x[(n, sl)] * _sd_salary_for_slot(by_name[n], id_to_label[sl])
@@ -989,7 +998,7 @@ def _sd_solve_one(
         if n in name_lock:
             model.Add(y[n] == 1)  # slot chosen by solver unless slot-locked below
 
-    # index tag -> engine slot ids
+    # canonical tag -> engine slot ids
     tag_to_slots: Dict[str, List[str]] = {}
     for sl in slot_ids:
         tag = id_to_label[sl].upper()  # FLEX1/2 -> FLEX; MVP/CPT passthrough
@@ -1000,7 +1009,7 @@ def _sd_solve_one(
         for sl in tag_to_slots.get(tag, []):
             model.Add(x[(n, sl)] == 0)
 
-    # slot-tagged locks (single-slot: ==1; multi-slot like FLEX: exactly one)
+    # slot-tagged locks (single-slot: ==1; multi-slot like FLEX: exactly one & block others)
     for n, tag in slot_lock:
         slots = tag_to_slots.get(tag, [])
         if not slots:
@@ -1008,29 +1017,40 @@ def _sd_solve_one(
         if len(slots) == 1:
             model.Add(x[(n, slots[0])] == 1)
         else:
-            model.Add(sum(x[(n, sl)] for sl in slots) == 1)  # exactly one FLEX*
-            for sl in slot_ids:                               # and forbid non-matching tags
+            model.Add(sum(x[(n, sl)] for sl in slots) == 1)
+            for sl in slot_ids:
                 if sl not in slots:
                     model.Add(x[(n, sl)] == 0)
 
-    # exposure caps already hit across the run
+    # per-player exposure caps already hit across the run
     for n in names:
         if used_player_counts.get(n, 0) >= player_caps.get(n, 10**9):
             model.Add(y[n] == 0)
 
-    # per-tag caps (name::slotId)
+    # ===== per-tag exposure caps (MIN/MAX) using canonical label keys =====
     for n in names:
-        for sl in slot_ids:
-            key = f"{n}::{sl}"
-            if used_tag_counts.get(key, 0) >= tag_caps.get(key, 10**9):
-                model.Add(x[(n, sl)] == 0)
+        for label, slots in tag_to_slots.items():
+            key = f"{n}::{label}"
+            cap_here = tag_caps.get(key, 10**9)
+            used_here = used_tag_counts.get(key, 0)
+            if used_here >= cap_here:
+                for sl in slots:
+                    model.Add(x[(n, sl)] == 0)
 
-    # forced include for min%
+    # forced include for min% (supports "Name" and "Name::CPT/MVP/FLEX")
     if forced_include:
         if "::" in forced_include:
-            nm, sl = forced_include.split("::", 1)
-            if (nm in names) and (sl in slot_ids):
-                model.Add(x[(nm, sl)] == 1)
+            nm, lab = forced_include.split("::", 1)
+            lab = lab.upper()
+            if (nm in names) and (lab in tag_to_slots):
+                slots = tag_to_slots[lab]
+                if len(slots) == 1:
+                    model.Add(x[(nm, slots[0])] == 1)
+                else:
+                    model.Add(sum(x[(nm, sl)] for sl in slots) == 1)
+                    for sl in slot_ids:
+                        if sl not in slots:
+                            model.Add(x[(nm, sl)] == 0)
         elif forced_include in y:
             model.Add(y[forced_include] == 1)
 
@@ -1039,7 +1059,7 @@ def _sd_solve_one(
     for lineup in prior_lineups:
         model.Add(sum(y[n] for n in lineup if n in y) <= roster_size - max(1, req.min_diff))
 
-    # lineup pOWN max (integerized)
+    # lineup pOWN cap (percentage points)
     if isinstance(req.lineup_pown_max, (int, float)) and req.lineup_pown_max is not None:
         lhs = sum(
             int(round(
@@ -1051,6 +1071,23 @@ def _sd_solve_one(
             for n in names for sl in slot_ids
         )
         model.Add(lhs <= int(round(req.lineup_pown_max)))
+
+    # ---- NEW: require at least two distinct teams in the lineup ----
+    all_teams = sorted({by_name[n].team for n in names if by_name[n].team})
+    if all_teams:
+        z_team: Dict[str, cp_model.IntVar] = {}
+        for t in all_teams:
+            z = model.NewBoolVar(f"sd_team_{t}")
+            z_team[t] = z
+            members = [n for n in names if by_name[n].team == t]
+            if not members:
+                model.Add(z == 0)
+            else:
+                # z_t == 1  <=> any player from team t is selected
+                model.Add(sum(y[n] for n in members) >= z)
+                model.Add(sum(y[n] for n in members) <= len(members) * z)
+        # At least two teams represented
+        model.Add(sum(z_team.values()) >= 2)
 
     # IF → THEN rules
     opp_map = _sd_team_to_opp_map(req.players)
@@ -1105,6 +1142,7 @@ def _sd_solve_one(
                     if helper_vars:
                         model.Add(sum(helper_vars) >= r.then_at_least * is_this)
 
+    # Objective
     model.Maximize(
         sum(
             int(_sd_metric_for_slot(by_name[n], id_to_label[sl], req.objective) * 1000) * x[(n, sl)]
@@ -1112,6 +1150,7 @@ def _sd_solve_one(
         )
     )
 
+    # Solve
     solver = cp_model.CpSolver()
     if req.time_limit_ms and req.time_limit_ms > 0:
         solver.parameters.max_time_in_seconds = req.time_limit_ms / 1000.0
@@ -1169,7 +1208,8 @@ def solve_showdown_stream(req: SDSolveRequest):
             for n in chosen:
                 used_player_counts[n] = used_player_counts.get(n, 0) + 1
             for sl, n in (slot_map or {}).items():
-                key = f"{n}::{sl}"
+                label = _sd_canonical_label(sl)   # FLEX1 -> FLEX, MVP/CPT unchanged
+                key = f"{n}::{label}"
                 used_tag_counts[key] = used_tag_counts.get(key, 0) + 1
             prior.append(chosen)
             produced += 1
@@ -1218,7 +1258,8 @@ def solve_showdown(req: SDSolveRequest):
         for n in chosen:
             used_player_counts[n] = used_player_counts.get(n, 0) + 1
         for sl, n in (slot_map or {}).items():
-            key = f"{n}::{sl}"
+            label = _sd_canonical_label(sl)   # FLEX1 -> FLEX
+            key = f"{n}::{label}"
             used_tag_counts[key] = used_tag_counts.get(key, 0) + 1
 
         prior.append(chosen)
@@ -1226,7 +1267,8 @@ def solve_showdown(req: SDSolveRequest):
         out.append({"drivers": ordered, "salary": salary, "total": total})
 
     return {"lineups": out, "produced": len(out)}
-# ========================== END SHOWDOWN SOLVER ==========================
+# ========================== END SHOWDOWN SOLVER ============================
+
 
 
 # === MLB MODELS & SOLVER — DROP-IN (stack teams + pitchers kept) ===
