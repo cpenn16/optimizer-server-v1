@@ -1029,20 +1029,18 @@ def solve_showdown(req: SDSolveRequest):
     return {"lineups": out, "produced": len(out)}
 # ========================== END SHOWDOWN SOLVER ============================
 
-
-
 # === MLB MODELS & SOLVER — DROP-IN (stack teams + pitchers kept) ===
 # Relies on: cp_model, random, StreamingResponse, sse_event(...), SSE_HEADERS
 
-from typing import Optional, Literal
-from pydantic import BaseModel, Field
+from typing import Optional, Literal, List, Dict
+from pydantic import BaseModel, Field, root_validator
 
 # ----------------------------- MLB models -----------------------------
 class MLBPlayer(BaseModel):
     name: str
     team: str
     opp: str
-    eligible: list[str]          # e.g., ["1B","OF"] or ["P"] (SP/RP are treated as "P")
+    eligible: List[str]          # e.g., ["1B","OF"] or ["P"] (SP/RP are treated as "P")
     salary: int
     proj: float
     floor: float = 0.0
@@ -1052,24 +1050,24 @@ class MLBPlayer(BaseModel):
 
 class MLBSlot(BaseModel):
     name: str
-    eligible: list[str]          # allowed positions for this slot (e.g., ["2B"], ["C","1B"], ["UTIL"])
+    eligible: List[str]          # allowed positions for this slot (e.g., ["2B"], ["C","1B"], ["UTIL"])
 
 class SolveMLBRequest(BaseModel):
     site: Literal["dk","fd"]
-    slots: list[MLBSlot]
-    players: list[MLBPlayer]
+    slots: List[MLBSlot]
+    players: List[MLBPlayer]
     n: int
     cap: int
     objective: Literal["proj","floor","ceil","pown","opt"] = "proj"
 
     # shared controls
-    locks: list[str] = Field(default_factory=list)
-    excludes: list[str] = Field(default_factory=list)
-    boosts: dict[str, int] = Field(default_factory=dict)    # ± steps; 1 step = ±3%
+    locks: List[str] = Field(default_factory=list)
+    excludes: List[str] = Field(default_factory=list)
+    boosts: Dict[str, int] = Field(default_factory=dict)    # ± steps; 1 step = ±3%
     randomness: float = 0.0                                  # 0..100 (%)
     global_max_pct: float = 100.0                            # overall exposure cap
-    min_pct: dict[str, float] = Field(default_factory=dict)  # per-player min exposure
-    max_pct: dict[str, float] = Field(default_factory=dict)  # per-player max exposure
+    min_pct: Dict[str, float] = Field(default_factory=dict)  # per-player min exposure
+    max_pct: Dict[str, float] = Field(default_factory=dict)  # per-player max exposure
     min_diff: int = 1                                        # lineup uniqueness (Hamming)
     time_limit_ms: int = 1500
 
@@ -1078,10 +1076,26 @@ class SolveMLBRequest(BaseModel):
     secondary_stack_size: int = 3          # hitters only, must differ from primary
     avoid_hitters_vs_opp_pitcher: bool = True
     max_hitters_vs_opp_pitcher: int = 0    # when avoid_* True, cap opposing hitters count
-    lineup_pown_max: Optional[float] = None  # sum of pOWN% across lineup, in percentage points
+
+    # Cap on SUM of lineup pOWN percentage points (e.g., 200 means 200 total pOWN points)
+    lineup_pown_max: Optional[float] = None
+
+    # Accept legacy/frontend alias and arbitrary extras safely
+    max_lineup_pown_pct: Optional[float] = None
+    # Optional: distinct teams requirement (default: FD=3, DK=2 for hitters+pitchers total)
+    min_distinct_teams: Optional[int] = None
 
     # 🔹 limit hitter pool & stack teams to this set (pitchers always allowed)
-    allowed_teams: list[str] = Field(default_factory=list)
+    allowed_teams: List[str] = Field(default_factory=list)
+
+    class Config:
+        extra = "ignore"  # ignore unknown fields from the client
+
+    @root_validator(pre=True)
+    def _unify_lineup_pown_cap(cls, values):
+        if values.get("lineup_pown_max") is None and values.get("max_lineup_pown_pct") is not None:
+            values["lineup_pown_max"] = values.get("max_lineup_pown_pct")
+        return values
 
 # ----------------------------- helpers -----------------------------
 def _mlb_metric(p: MLBPlayer, objective: str) -> float:
@@ -1100,17 +1114,17 @@ def _mlb_score(p: MLBPlayer, objective: str, boost_steps: int, randomness_pct: f
         boosted *= (1.0 + random.uniform(-r, r))
     return boosted
 
-def _cap_counts(req: SolveMLBRequest) -> dict[str, int]:
+def _cap_counts(req: SolveMLBRequest) -> Dict[str, int]:
     """Per-player max counts from global & per-player caps (can be zero)."""
     N = max(1, int(req.n))
     gcap = int(min(max(req.global_max_pct, 0.0), 100.0) / 100.0 * N)
-    caps: dict[str, int] = {}
+    caps: Dict[str, int] = {}
     for p in req.players:
         per = int(min(max(req.max_pct.get(p.name, 100.0), 0.0), 100.0) / 100.0 * N)
         caps[p.name] = min(per, gcap) if gcap > 0 else 0
     return caps
 
-def _mins_needed(req: SolveMLBRequest, counts: dict[str, int]) -> Optional[str]:
+def _mins_needed(req: SolveMLBRequest, counts: Dict[str, int]) -> Optional[str]:
     """Pick a player under min% exposure to force include (highest proj first)."""
     needs = []
     N = max(1, int(req.n))
@@ -1126,16 +1140,16 @@ def _mins_needed(req: SolveMLBRequest, counts: dict[str, int]) -> Optional[str]:
 # ----------------------------- core solver -----------------------------
 def _solve_one_mlb(
     req: SolveMLBRequest,
-    scores: dict[str, float],
-    used: dict[str, int],
-    caps: dict[str, int],
+    scores: Dict[str, float],
+    used: Dict[str, int],
+    caps: Dict[str, int],
     forced_include: Optional[str],
-    prior_lineups: list[list[str]],
+    prior_lineups: List[List[str]],
 ):
     model = cp_model.CpModel()
 
     # Normalize positions: treat SP/RP as P
-    def norm_elig(e: list[str]) -> set[str]:
+    def norm_elig(e: List[str]) -> set:
         out = set()
         for pos in (e or []):
             s = str(pos or "").upper().strip()
@@ -1143,16 +1157,16 @@ def _solve_one_mlb(
             out.add(s)
         return out
 
-    by_name: dict[str, MLBPlayer] = {p.name: p for p in req.players}
+    by_name: Dict[str, MLBPlayer] = {p.name: p for p in req.players}
     names = list(by_name.keys())
     slot_names = [s.name for s in req.slots]
 
     # decision vars: x[(name,slot)] and y[name]
-    x: dict[tuple[str, str], cp_model.IntVar] = {}
+    x: Dict[tuple, cp_model.IntVar] = {}
     for n in names:
         for sl in slot_names:
             x[(n, sl)] = model.NewBoolVar(f"x_{n}_{sl}")
-    y: dict[str, cp_model.IntVar] = {n: model.NewBoolVar(f"y_{n}") for n in names}
+    y: Dict[str, cp_model.IntVar] = {n: model.NewBoolVar(f"y_{n}") for n in names}
     for n in names:
         model.Add(sum(x[(n, sl)] for sl in slot_names) == y[n])
 
@@ -1165,14 +1179,14 @@ def _solve_one_mlb(
                 model.Add(x[(n, sl)] == 0)
         model.Add(sum(x[(n, sl)] for n in names) == 1)
 
-    # at most one slot per player (redundant, keeps hardness)
+    # at most one slot per player
     for n in names:
         model.Add(sum(x[(n, sl)] for sl in slot_names) <= 1)
 
     # salary cap
     model.Add(sum(y[n] * by_name[n].salary for n in names) <= req.cap)
 
-    # -------- locks/excludes (name-wide) ----------
+    # -------- locks/excludes ----------
     excl = set(req.excludes or [])
     lock = set(req.locks or [])
     for n in names:
@@ -1228,35 +1242,50 @@ def _solve_one_mlb(
     else:
         teams = sorted({by_name[n].team for n in hitters if by_name[n].team})
 
+    # Pre-check which teams can meet stack sizes with current pool
+    def can_meet(team: str, size: int) -> bool:
+        if size <= 0: return True
+        count = sum(1 for n in hitters if by_name[n].team == team)
+        return count >= size
+
     # ---- Hitter-only stacking ----
-    # Primary: at least primary_stack_size hitters from exactly one team
-    b_primary = {}
-    if req.primary_stack_size and req.primary_stack_size > 0 and teams:
+    b_primary: Dict[str, cp_model.IntVar] = {}
+    enforce_primary = req.primary_stack_size > 0 and any(can_meet(t, req.primary_stack_size) for t in teams)
+    if enforce_primary:
         b_primary = {t: model.NewBoolVar(f"primary_{t}") for t in teams}
         for t, v in b_primary.items():
             t_hitters = [n for n in hitters if by_name[n].team == t]
-            if t_hitters:
+            if t_hitters and can_meet(t, req.primary_stack_size):
                 model.Add(sum(y[n] for n in t_hitters) >= req.primary_stack_size * v)
             else:
                 model.Add(v == 0)
+        # exactly one primary team only if feasible
         model.Add(sum(b_primary.values()) == 1)
 
-    # Secondary: at least secondary_stack_size hitters from exactly one team, different from primary
-    if req.secondary_stack_size and req.secondary_stack_size > 0 and len(teams) >= (2 if b_primary else 1):
+    # Secondary stack: different team from primary (when feasible)
+    enforce_secondary = req.secondary_stack_size > 0 and any(can_meet(t, req.secondary_stack_size) for t in teams)
+    if enforce_secondary:
         b_secondary = {t: model.NewBoolVar(f"secondary_{t}") for t in teams}
         for t, v in b_secondary.items():
             t_hitters = [n for n in hitters if by_name[n].team == t]
-            if t_hitters:
+            if t_hitters and can_meet(t, req.secondary_stack_size):
                 model.Add(sum(y[n] for n in t_hitters) >= req.secondary_stack_size * v)
             else:
                 model.Add(v == 0)
         if b_primary:
             for t in teams:
+                # cannot select the same team for primary & secondary
                 model.Add(b_primary[t] + b_secondary[t] <= 1)
-        model.Add(sum(b_secondary.values()) == 1)
+            # only require one secondary if there exists a team distinct from primary that can meet it
+            model.Add(sum(b_secondary.values()) == 1)
+        else:
+            model.Add(sum(b_secondary.values()) == 1)
 
-    # FanDuel: lineup must include at least 3 different MLB teams (P can overlap)
-    if req.site == "fd":
+    # Distinct teams (site rule; allow client override)
+    min_distinct = req.min_distinct_teams
+    if min_distinct is None:
+        min_distinct = 3 if req.site == "fd" else 2
+    if min_distinct and min_distinct > 1:
         all_teams = sorted({by_name[n].team for n in names if by_name[n].team})
         if all_teams:
             z_team = {t: model.NewBoolVar(f"team_sel_{t}") for t in all_teams}
@@ -1265,15 +1294,14 @@ def _solve_one_mlb(
                 if not members:
                     model.Add(z_team[t] == 0)
                     continue
-                # z_t == 1  <=>  any player from team t is selected
                 model.Add(sum(y[n] for n in members) >= z_team[t])
                 model.Add(sum(y[n] for n in members) <= len(members) * z_team[t])
-            model.Add(sum(z_team.values()) >= 3)
+            model.Add(sum(z_team.values()) >= int(min_distinct))
 
     # Lineup pOWN% cap (percentage points, e.g., 200 means 200 total pOWN points)
     if isinstance(req.lineup_pown_max, (int, float)) and req.lineup_pown_max is not None:
         lhs = sum(int(round(by_name[n].pown * 100)) * y[n] for n in names)
-        model.Add(lhs <= int(round(req.lineup_pown_max)))
+        model.Add(lhs <= int(round(max(0.0, float(req.lineup_pown_max)))))
 
     # Objective
     model.Maximize(sum(int(scores[n] * 1000) * y[n] for n in names))
@@ -1300,8 +1328,8 @@ def _solve_one_mlb(
 @app.post("/solve_mlb_stream")
 def solve_mlb_stream(req: SolveMLBRequest):
     random.seed()
-    counts: dict[str, int] = {}
-    prior: list[list[str]] = []
+    counts: Dict[str, int] = {}
+    prior: List[List[str]] = []
     caps = _cap_counts(req)
 
     def gen():
@@ -1310,7 +1338,7 @@ def solve_mlb_stream(req: SolveMLBRequest):
         produced = 0
         for i in range(req.n):
             # iteration scores with boosts + randomness
-            scores: dict[str, float] = {}
+            scores: Dict[str, float] = {}
             for p in req.players:
                 b = (req.boosts or {}).get(p.name, 0)
                 scores[p.name] = _mlb_score(p, req.objective, b, req.randomness)
@@ -1350,13 +1378,13 @@ def solve_mlb_stream(req: SolveMLBRequest):
 @app.post("/solve_mlb")
 def solve_mlb(req: SolveMLBRequest):
     random.seed()
-    counts: dict[str, int] = {}
-    prior: list[list[str]] = []
+    counts: Dict[str, int] = {}
+    prior: List[List[str]] = []
     caps = _cap_counts(req)
     out = []
 
     for _ in range(req.n):
-        scores: dict[str, float] = {}
+        scores: Dict[str, float] = {}
         for p in req.players:
             b = (req.boosts or {}).get(p.name, 0)
             scores[p.name] = _mlb_score(p, req.objective, b, req.randomness)
