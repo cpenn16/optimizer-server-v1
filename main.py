@@ -10,7 +10,7 @@
 from typing import List, Dict, Optional, Literal, Tuple, Set
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 from starlette.responses import StreamingResponse
 from ortools.sat.python import cp_model
 import random
@@ -100,6 +100,16 @@ class SolveNFLRequest(BaseModel):
 
     # Cap on SUM of lineup pOWN percentage points (e.g., 200 means 200 total pOWN points)
     lineup_pown_max: Optional[float] = None
+
+    # 🔹 Accept legacy/frontend key too; harmonized in validator below
+    max_lineup_pown_pct: Optional[float] = None
+
+    @root_validator(pre=True)
+    def _unify_lineup_pown_cap(cls, values):
+        # If the preferred key is missing but legacy key is present, copy it over.
+        if values.get("lineup_pown_max") is None and values.get("max_lineup_pown_pct") is not None:
+            values["lineup_pown_max"] = values.get("max_lineup_pown_pct")
+        return values
 
 # ----------------------------- helpers -----------------------------
 def _metric(p: NFLPlayer, objective: str) -> float:
@@ -351,10 +361,11 @@ def _solve_one_nfl(
             else:
                 model.Add(v == 0)
 
-    # lineup pOWN% cap (percentage points)
-    if isinstance(req.lineup_pown_max, (int, float)) and req.lineup_pown_max is not None:
-        lhs = sum(int(round(by_name[n].pown * 100)) * y[n] for n in names)
-        model.Add(lhs <= int(round(req.lineup_pown_max)))
+    # lineup pOWN% cap (percentage points; e.g., 200 means total pOWN sum ≤ 200)
+    if req.lineup_pown_max is not None:
+        cap = int(round(max(0.0, float(req.lineup_pown_max))))
+        lhs = sum(int(round(by_name[n].pown * 100.0)) * y[n] for n in names)
+        model.Add(lhs <= cap)
 
     # objective
     model.Maximize(sum(int(scores[n] * 1000) * y[n] for n in names))
