@@ -1401,3 +1401,234 @@ def solve_mlb(req: SolveMLBRequest):
         out.append({"drivers": sorted(chosen), "salary": salary, "total": total})
 
     return {"lineups": out, "produced": len(out)}
+
+# ======================= NASCAR (Cup/Xfinity/Trucks) =======================
+# Matches the CupOptimizer.jsx client:
+# - POST /cup/solve_stream  (raw JSON chunks, one per lineup, separated by \n\n)
+# - POST /cup/solve         (batch JSON)
+# Payload keys: players[], roster, cap, n, objective, locks, excludes, boosts,
+# randomness, global_max_pct, min_pct, max_pct, min_diff, time_limit_ms, groups[].
+# Response keys: drivers[], salary, total
+
+from typing import List, Dict, Optional, Literal, Tuple
+from pydantic import BaseModel, Field
+from ortools.sat.python import cp_model
+from starlette.responses import StreamingResponse
+import json, random
+
+# ----- models (mirror the frontend) ----------------------------------
+Site = Literal["dk","fd"]
+
+class CupPlayer(BaseModel):
+    driver: str
+    salary: int
+    proj: float
+    floor: float = 0.0
+    ceil: float  = 0.0
+    pown: float  = 0.0   # 0..1
+    opt: float   = 0.0   # 0..1
+    class Config:
+        extra = "ignore"
+
+class CupGroup(BaseModel):
+    mode: Literal["at_most","at_least","exactly"] = "at_most"
+    count: int = 1
+    players: List[str] = Field(default_factory=list)
+
+class CupSolveRequest(BaseModel):
+    site: Site = "dk"
+    players: List[CupPlayer]
+    roster: int
+    cap: int
+    n: int
+    objective: Literal["proj","floor","ceil","pown","opt"] = "proj"
+
+    locks: List[str] = Field(default_factory=list)
+    excludes: List[str] = Field(default_factory=list)
+    boosts: Dict[str, int] = Field(default_factory=dict)  # steps; 1 step = +3%
+    randomness: float = 0.0                                # 0..100 (%)
+    global_max_pct: float = 100.0
+    min_pct: Dict[str, float] = Field(default_factory=dict)
+    max_pct: Dict[str, float] = Field(default_factory=dict)
+    min_diff: int = 1
+    time_limit_ms: int = 1500
+
+    groups: List[CupGroup] = Field(default_factory=list)
+
+    # tolerated extra hint (the UI adds {series: "cup"})
+    class Config:
+        extra = "ignore"
+
+# ----- helpers --------------------------------------------------------
+def _metric(p: CupPlayer, obj: str) -> float:
+    if obj == "proj": return p.proj
+    if obj == "floor": return p.floor
+    if obj == "ceil":  return p.ceil
+    if obj == "pown":  return p.pown * 100.0
+    if obj == "opt":   return p.opt  * 100.0
+    return p.proj
+
+def _score(p: CupPlayer, obj: str, boost_steps: int, rand_pct: float) -> float:
+    base = _metric(p, obj)
+    boosted = base * (1.0 + 0.03 * (boost_steps or 0))
+    if rand_pct > 0.0:
+        r = rand_pct / 100.0
+        boosted *= (1.0 + random.uniform(-r, r))
+    return boosted
+
+def _cap_from_pct(N: int, pct: float) -> int:
+    return int(max(0.0, min(100.0, pct)) / 100.0 * N)
+
+def _player_caps(req: CupSolveRequest) -> Dict[str, int]:
+    N = max(1, int(req.n))
+    gcap = _cap_from_pct(N, req.global_max_pct)
+    caps: Dict[str, int] = {}
+    for p in req.players:
+        per = _cap_from_pct(N, req.max_pct.get(p.driver, 100.0))
+        caps[p.driver] = min(per, gcap) if gcap > 0 else 0
+    return caps
+
+def _min_need(req: CupSolveRequest, counts: Dict[str, int]) -> Optional[str]:
+    N = max(1, int(req.n))
+    needers = []
+    for p in req.players:
+        need = _cap_from_pct(N, req.min_pct.get(p.driver, 0.0))
+        if counts.get(p.driver, 0) < need:
+            needers.append(p)
+    if not needers:
+        return None
+    needers.sort(key=lambda r: r.proj, reverse=True)
+    return needers[0].driver
+
+def _scores(req: CupSolveRequest) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for p in req.players:
+        out[p.driver] = _score(p, req.objective, (req.boosts or {}).get(p.driver, 0), req.randomness)
+    return out
+
+# ----- single-lineup solver ------------------------------------------
+def _solve_one(
+    req: CupSolveRequest,
+    scores: Dict[str, float],
+    used_counts: Dict[str, int],
+    caps: Dict[str, int],
+    forced_include: Optional[str],
+    prior: List[List[str]],
+) -> Optional[Tuple[List[str], int, float]]:
+    model = cp_model.CpModel()
+
+    by_name = {p.driver: p for p in req.players}
+    names = list(by_name.keys())
+    roster = int(req.roster)
+
+    # decision vars
+    y: Dict[str, cp_model.IntVar] = {n: model.NewBoolVar(f"y_{n}") for n in names}
+
+    # roster size & salary cap
+    model.Add(sum(y[n] for n in names) == roster)
+    model.Add(sum(y[n] * by_name[n].salary for n in names) <= req.cap)
+
+    # locks/excludes
+    excl = set(req.excludes or [])
+    lock = set(req.locks or [])
+    for n in names:
+        if n in excl: model.Add(y[n] == 0)
+        if n in lock: model.Add(y[n] == 1)
+
+    # exposure caps already hit
+    for n in names:
+        if used_counts.get(n, 0) >= caps.get(n, 10**9):
+            model.Add(y[n] == 0)
+
+    # forced include for min%
+    if forced_include and forced_include in y:
+        model.Add(y[forced_include] == 1)
+
+    # groups
+    for g in req.groups or []:
+        vars_in = [y[n] for n in g.players if n in y]
+        if not vars_in: continue
+        s = sum(vars_in)
+        if g.mode == "at_most":   model.Add(s <= g.count)
+        elif g.mode == "at_least":model.Add(s >= g.count)
+        elif g.mode == "exactly": model.Add(s == g.count)
+
+    # uniqueness vs prior (Hamming distance)
+    for prev in prior:
+        model.Add(sum(y[n] for n in prev if n in y) <= roster - max(1, req.min_diff))
+
+    # objective
+    model.Maximize(sum(int(scores[n] * 1000) * y[n] for n in names))
+
+    solver = cp_model.CpSolver()
+    if req.time_limit_ms and req.time_limit_ms > 0:
+        solver.parameters.max_time_in_seconds = req.time_limit_ms / 1000.0
+    solver.parameters.num_search_workers = 8
+
+    res = solver.Solve(model)
+    if res not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return None
+
+    chosen = [n for n in names if solver.Value(y[n]) == 1]
+    if len(chosen) != roster:  # guard
+        return None
+
+    salary = sum(by_name[n].salary for n in chosen)
+    total  = sum(_metric(by_name[n], req.objective) for n in chosen)
+    return chosen, salary, total
+
+# ----- STREAM: raw JSON chunks separated by blank lines ----------------
+@app.post("/cup/solve_stream")
+def cup_solve_stream(req: CupSolveRequest):
+    random.seed()
+
+    counts: Dict[str, int] = {}
+    caps = _player_caps(req)
+    prior: List[List[str]] = []
+
+    def gen():
+        produced = 0
+        for _ in range(req.n):
+            sc = _scores(req)
+            forced = _min_need(req, counts)
+            ans = _solve_one(req, sc, counts, caps, forced, prior)
+            if not ans:
+                # match client: send a 'done' chunk then stop
+                yield (json.dumps({"done": True, "reason": "no_more_unique_or_exposure_capped", "produced": produced}) + "\n\n").encode()
+                return
+            chosen, salary, total = ans
+            for n in chosen:
+                counts[n] = counts.get(n, 0) + 1
+            prior.append(chosen)
+            produced += 1
+            chunk = {"drivers": sorted(chosen), "salary": salary, "total": total}
+            yield (json.dumps(chunk) + "\n\n").encode()
+        yield (json.dumps({"done": True, "produced": produced}) + "\n\n").encode()
+
+    # no SSE headers on purpose; client parses raw JSON parts
+    return StreamingResponse(gen(), media_type="application/octet-stream")
+
+# ----- BATCH -----------------------------------------------------------
+@app.post("/cup/solve")
+def cup_solve(req: CupSolveRequest):
+    random.seed()
+
+    counts: Dict[str, int] = {}
+    caps = _player_caps(req)
+    prior: List[List[str]] = []
+    out = []
+
+    for _ in range(req.n):
+        sc = _scores(req)
+        forced = _min_need(req, counts)
+        ans = _solve_one(req, sc, counts, caps, forced, prior)
+        if not ans:
+            break
+        chosen, salary, total = ans
+        for n in chosen:
+            counts[n] = counts.get(n, 0) + 1
+        prior.append(chosen)
+        out.append({"drivers": sorted(chosen), "salary": salary, "total": total})
+
+    return {"lineups": out, "produced": len(out)}
+# ===================== END NASCAR (Cup/Xfinity/Trucks) =====================
