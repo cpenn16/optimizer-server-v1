@@ -1,20 +1,22 @@
 # main.py — NFL Classic Optimizer Backend (FastAPI + OR-Tools)
 # ------------------------------------------------------------
 # Requirements:
-#   pip install fastapi uvicorn ortools pydantic
+#   pip install fastapi uvicorn "pydantic>=2" ortools
 #
 # Endpoints:
 #   POST /solve_nfl_stream  (SSE; streams one lineup per event)
 #   POST /solve_nfl         (batch; returns all lineups in one JSON)
 
 from typing import List, Dict, Optional, Literal, Tuple, Set
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, root_validator
+from pydantic import BaseModel, Field, model_validator
 from starlette.responses import StreamingResponse
 from ortools.sat.python import cp_model
 import random
 import json
+import logging
+import traceback
 
 # ----------------------------- app & CORS -----------------------------
 app = FastAPI()
@@ -25,6 +27,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+log = logging.getLogger("optimizer")
+logging.basicConfig(level=logging.INFO)
 
 # Streaming headers (work well with Nginx/Cloudflare/Render)
 SSE_HEADERS = {
@@ -104,15 +109,15 @@ class SolveNFLRequest(BaseModel):
     # 🔹 Accept legacy/frontend key too; harmonized in validator below
     max_lineup_pown_pct: Optional[float] = None
 
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def _unify_lineup_pown_cap(cls, values):
-        # If the preferred key is missing but legacy key is present, copy it over.
         if values.get("lineup_pown_max") is None and values.get("max_lineup_pown_pct") is not None:
             values["lineup_pown_max"] = values.get("max_lineup_pown_pct")
         return values
 
 # ----------------------------- helpers -----------------------------
-def _metric(p: NFLPlayer, objective: str) -> float:
+def _nfl_metric(p: NFLPlayer, objective: str) -> float:
     if objective == "proj": return p.proj
     if objective == "floor": return p.floor
     if objective == "ceil":  return p.ceil
@@ -120,8 +125,8 @@ def _metric(p: NFLPlayer, objective: str) -> float:
     if objective == "opt":   return p.opt * 100.0
     return p.proj
 
-def _score(p: NFLPlayer, objective: str, boost_steps: int, randomness_pct: float) -> float:
-    base = _metric(p, objective)
+def _nfl_score(p: NFLPlayer, objective: str, boost_steps: int, randomness_pct: float) -> float:
+    base = _nfl_metric(p, objective)
     boosted = base * (1.0 + 0.03 * (boost_steps or 0))
     if randomness_pct > 0:
         r = randomness_pct / 100.0
@@ -170,7 +175,7 @@ def _scores_for_iteration(req: SolveNFLRequest) -> Dict[str, float]:
     scores: Dict[str, float] = {}
     for p in req.players:
         b = (req.boosts or {}).get(p.name, 0)
-        scores[p.name] = _score(p, req.objective, b, req.randomness)
+        scores[p.name] = _nfl_score(p, req.objective, b, req.randomness)
     return scores
 
 def _team_rule_for(team: str, rules: List[TeamStackRule]) -> TeamStackRule:
@@ -262,7 +267,6 @@ def _solve_one_nfl(
             model.Add(s == g.count)
 
     # ---- team-level constraints
-    # Global/per-team max_from_team (with overrides)
     by_team: Dict[str, List[str]] = {}
     for n in names:
         by_team.setdefault(by_name[n].team, []).append(n)
@@ -363,8 +367,11 @@ def _solve_one_nfl(
 
     # lineup pOWN% cap (percentage points; e.g., 200 means total pOWN sum ≤ 200)
     if req.lineup_pown_max is not None:
+        def _safe_pct(x):
+            try: return float(x or 0.0)
+            except: return 0.0
         cap = int(round(max(0.0, float(req.lineup_pown_max))))
-        lhs = sum(int(round(by_name[n].pown * 100.0)) * y[n] for n in names)
+        lhs = sum(int(round(_safe_pct(by_name[n].pown) * 100.0)) * y[n] for n in names)
         model.Add(lhs <= cap)
 
     # objective
@@ -385,7 +392,7 @@ def _solve_one_nfl(
         return None
 
     salary = sum(by_name[n].salary for n in chosen)
-    total = sum(_metric(by_name[n], req.objective) for n in chosen)
+    total = sum(_nfl_metric(by_name[n], req.objective) for n in chosen)
 
     qb_team = ""
     for team, v in qb_team_vars.items():
@@ -398,20 +405,74 @@ def _solve_one_nfl(
 # ----------------------------- endpoints -----------------------------
 @app.post("/solve_nfl_stream")
 def solve_nfl_stream(req: SolveNFLRequest):
-    random.seed()
+    try:
+        random.seed()
 
-    used_player_counts: Dict[str, int] = {}
-    prior: List[List[str]] = []
-    player_caps = _player_caps(req)
+        used_player_counts: Dict[str, int] = {}
+        prior: List[List[str]] = []
+        player_caps = _player_caps(req)
 
-    qb_team_caps_used: Dict[str, int] = {}
-    qb_team_caps = _qb_team_caps(req)
+        qb_team_caps_used: Dict[str, int] = {}
+        qb_team_caps = _qb_team_caps(req)
 
-    def gen():
-        # small heartbeat so proxies flush early
-        yield b":hb\n\n"
-        produced = 0
-        for i in range(req.n):
+        def gen():
+            # small heartbeat so proxies flush early
+            yield b":hb\n\n"
+            produced = 0
+            for i in range(req.n):
+                scores = _scores_for_iteration(req)
+                include = _min_need_player(req, used_player_counts)
+
+                ans = _solve_one_nfl(
+                    req, scores, used_player_counts, player_caps,
+                    include, prior, qb_team_caps_used, qb_team_caps
+                )
+                if not ans:
+                    yield sse_event({"done": True, "reason": "no_more_unique_or_exposure_capped", "produced": produced})
+                    return
+
+                chosen, salary, total, qb_team = ans
+
+                for n in chosen:
+                    used_player_counts[n] = used_player_counts.get(n, 0) + 1
+                if qb_team:
+                    qb_team_caps_used[qb_team] = qb_team_caps_used.get(qb_team, 0) + 1
+
+                prior.append(chosen)
+                produced += 1
+
+                yield sse_event({
+                    "index": i + 1,
+                    "drivers": sorted(chosen),
+                    "salary": salary,
+                    "total": total,
+                })
+
+            yield sse_event({"done": True, "produced": produced})
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
+        )
+    except Exception as e:
+        log.error("solve_nfl_stream error:\n%s", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/solve_nfl")
+def solve_nfl(req: SolveNFLRequest):
+    try:
+        random.seed()
+
+        used_player_counts: Dict[str, int] = {}
+        prior: List[List[str]] = []
+        player_caps = _player_caps(req)
+
+        qb_team_caps_used: Dict[str, int] = {}
+        qb_team_caps = _qb_team_caps(req)
+
+        out = []
+        for _ in range(req.n):
             scores = _scores_for_iteration(req)
             include = _min_need_player(req, used_player_counts)
 
@@ -420,8 +481,7 @@ def solve_nfl_stream(req: SolveNFLRequest):
                 include, prior, qb_team_caps_used, qb_team_caps
             )
             if not ans:
-                yield sse_event({"done": True, "reason": "no_more_unique_or_exposure_capped", "produced": produced})
-                return
+                break
 
             chosen, salary, total, qb_team = ans
 
@@ -431,57 +491,12 @@ def solve_nfl_stream(req: SolveNFLRequest):
                 qb_team_caps_used[qb_team] = qb_team_caps_used.get(qb_team, 0) + 1
 
             prior.append(chosen)
-            produced += 1
+            out.append({"drivers": sorted(chosen), "salary": salary, "total": total})
 
-            yield sse_event({
-                "index": i + 1,
-                "drivers": sorted(chosen),
-                "salary": salary,
-                "total": total,
-            })
-
-        yield sse_event({"done": True, "produced": produced})
-
-    return StreamingResponse(
-        gen(),
-        media_type="text/event-stream",
-        headers=SSE_HEADERS,
-    )
-
-@app.post("/solve_nfl")
-def solve_nfl(req: SolveNFLRequest):
-    random.seed()
-
-    used_player_counts: Dict[str, int] = {}
-    prior: List[List[str]] = []
-    player_caps = _player_caps(req)
-
-    qb_team_caps_used: Dict[str, int] = {}
-    qb_team_caps = _qb_team_caps(req)
-
-    out = []
-    for _ in range(req.n):
-        scores = _scores_for_iteration(req)
-        include = _min_need_player(req, used_player_counts)
-
-        ans = _solve_one_nfl(
-            req, scores, used_player_counts, player_caps,
-            include, prior, qb_team_caps_used, qb_team_caps
-        )
-        if not ans:
-            break
-
-        chosen, salary, total, qb_team = ans
-
-        for n in chosen:
-            used_player_counts[n] = used_player_counts.get(n, 0) + 1
-        if qb_team:
-            qb_team_caps_used[qb_team] = qb_team_caps_used.get(qb_team, 0) + 1
-
-        prior.append(chosen)
-        out.append({"drivers": sorted(chosen), "salary": salary, "total": total})
-
-    return {"lineups": out, "produced": len(out)}
+        return {"lineups": out, "produced": len(out)}
+    except Exception as e:
+        log.error("solve_nfl error:\n%s", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============================ SHOWDOWN SOLVER ============================
 # Paste this entire block at the very bottom of main.py
@@ -1403,7 +1418,7 @@ def solve_mlb(req: SolveMLBRequest):
     return {"lineups": out, "produced": len(out)}
 
 # ======================= NASCAR (Cup/Xfinity/Trucks) =======================
-# Matches the CupOptimizer.jsx client:
+# Matches the frontend:
 # - POST /cup/solve_stream  (raw JSON chunks, one per lineup, separated by \n\n)
 # - POST /cup/solve         (batch JSON)
 # Payload keys: players[], roster, cap, n, objective, locks, excludes, boosts,
@@ -1455,12 +1470,12 @@ class CupSolveRequest(BaseModel):
 
     groups: List[CupGroup] = Field(default_factory=list)
 
-    # tolerated extra hint (the UI adds {series: "cup"})
+    # tolerated extra hint (the UI may add {series: "cup"})
     class Config:
         extra = "ignore"
 
 # ----- helpers --------------------------------------------------------
-def _metric(p: CupPlayer, obj: str) -> float:
+def _cup_metric(p: CupPlayer, obj: str) -> float:
     if obj == "proj": return p.proj
     if obj == "floor": return p.floor
     if obj == "ceil":  return p.ceil
@@ -1468,31 +1483,31 @@ def _metric(p: CupPlayer, obj: str) -> float:
     if obj == "opt":   return p.opt  * 100.0
     return p.proj
 
-def _score(p: CupPlayer, obj: str, boost_steps: int, rand_pct: float) -> float:
-    base = _metric(p, obj)
+def _cup_score(p: CupPlayer, obj: str, rand_pct: float, boost_steps: int) -> float:
+    base = _cup_metric(p, obj)
     boosted = base * (1.0 + 0.03 * (boost_steps or 0))
     if rand_pct > 0.0:
         r = rand_pct / 100.0
         boosted *= (1.0 + random.uniform(-r, r))
     return boosted
 
-def _cap_from_pct(N: int, pct: float) -> int:
+def _cup_cap_from_pct(N: int, pct: float) -> int:
     return int(max(0.0, min(100.0, pct)) / 100.0 * N)
 
-def _player_caps(req: CupSolveRequest) -> Dict[str, int]:
+def _cup_player_caps(req: CupSolveRequest) -> Dict[str, int]:
     N = max(1, int(req.n))
-    gcap = _cap_from_pct(N, req.global_max_pct)
+    gcap = _cup_cap_from_pct(N, req.global_max_pct)
     caps: Dict[str, int] = {}
     for p in req.players:
-        per = _cap_from_pct(N, req.max_pct.get(p.driver, 100.0))
+        per = _cup_cap_from_pct(N, req.max_pct.get(p.driver, 100.0))
         caps[p.driver] = min(per, gcap) if gcap > 0 else 0
     return caps
 
-def _min_need(req: CupSolveRequest, counts: Dict[str, int]) -> Optional[str]:
+def _cup_min_need(req: CupSolveRequest, counts: Dict[str, int]) -> Optional[str]:
     N = max(1, int(req.n))
     needers = []
     for p in req.players:
-        need = _cap_from_pct(N, req.min_pct.get(p.driver, 0.0))
+        need = _cup_cap_from_pct(N, req.min_pct.get(p.driver, 0.0))
         if counts.get(p.driver, 0) < need:
             needers.append(p)
     if not needers:
@@ -1500,14 +1515,14 @@ def _min_need(req: CupSolveRequest, counts: Dict[str, int]) -> Optional[str]:
     needers.sort(key=lambda r: r.proj, reverse=True)
     return needers[0].driver
 
-def _scores(req: CupSolveRequest) -> Dict[str, float]:
+def _cup_scores(req: CupSolveRequest) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for p in req.players:
-        out[p.driver] = _score(p, req.objective, (req.boosts or {}).get(p.driver, 0), req.randomness)
+        out[p.driver] = _cup_score(p, req.objective, req.randomness, (req.boosts or {}).get(p.driver, 0))
     return out
 
 # ----- single-lineup solver ------------------------------------------
-def _solve_one(
+def _cup_solve_one(
     req: CupSolveRequest,
     scores: Dict[str, float],
     used_counts: Dict[str, int],
@@ -1574,7 +1589,7 @@ def _solve_one(
         return None
 
     salary = sum(by_name[n].salary for n in chosen)
-    total  = sum(_metric(by_name[n], req.objective) for n in chosen)
+    total  = sum(_cup_metric(by_name[n], req.objective) for n in chosen)
     return chosen, salary, total
 
 # ----- STREAM: raw JSON chunks separated by blank lines ----------------
@@ -1583,17 +1598,17 @@ def cup_solve_stream(req: CupSolveRequest):
     random.seed()
 
     counts: Dict[str, int] = {}
-    caps = _player_caps(req)
+    caps = _cup_player_caps(req)
     prior: List[List[str]] = []
 
     def gen():
         produced = 0
         for _ in range(req.n):
-            sc = _scores(req)
-            forced = _min_need(req, counts)
-            ans = _solve_one(req, sc, counts, caps, forced, prior)
+            sc = _cup_scores(req)
+            forced = _cup_min_need(req, counts)
+            ans = _cup_solve_one(req, sc, counts, caps, forced, prior)
             if not ans:
-                # match client: send a 'done' chunk then stop
+                # send a 'done' chunk then stop
                 yield (json.dumps({"done": True, "reason": "no_more_unique_or_exposure_capped", "produced": produced}) + "\n\n").encode()
                 return
             chosen, salary, total = ans
@@ -1614,14 +1629,14 @@ def cup_solve(req: CupSolveRequest):
     random.seed()
 
     counts: Dict[str, int] = {}
-    caps = _player_caps(req)
+    caps = _cup_player_caps(req)
     prior: List[List[str]] = []
     out = []
 
     for _ in range(req.n):
-        sc = _scores(req)
-        forced = _min_need(req, counts)
-        ans = _solve_one(req, sc, counts, caps, forced, prior)
+        sc = _cup_scores(req)
+        forced = _cup_min_need(req, counts)
+        ans = _cup_solve_one(req, sc, counts, caps, forced, prior)
         if not ans:
             break
         chosen, salary, total = ans
