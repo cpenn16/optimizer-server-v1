@@ -1417,13 +1417,43 @@ def solve_mlb(req: SolveMLBRequest):
 
     return {"lineups": out, "produced": len(out)}
 
-# ======================= NASCAR (Cup/Xfinity/Trucks) =======================
-# Matches the frontend:
-# - POST /cup/solve_stream  (raw JSON chunks, one per lineup, separated by \n\n)
-# - POST /cup/solve         (batch JSON)
-# Payload keys: players[], roster, cap, n, objective, locks, excludes, boosts,
-# randomness, global_max_pct, min_pct, max_pct, min_diff, time_limit_ms, groups[].
-# Response keys: drivers[], salary, total
+# ======================= NASCAR (Cup / Xfinity / Trucks) =======================
+# Frontend contract:
+# - POST /cup/solve_stream     → raw JSON chunks, one per lineup, separated by \n\n
+# - POST /cup/solve            → batch JSON
+# - POST /xfinity/solve_stream → same as cup
+# - POST /xfinity/solve        → same as cup
+# - POST /trucks/solve_stream  → same as cup
+# - POST /trucks/solve         → same as cup
+#
+# Request payload (all series):
+# {
+#   "site": "dk"|"fd",
+#   "players": [{"driver": str, "salary": int, "proj": float, "floor": float, "ceil": float,
+#                "pown": float, "opt": float}],
+#   "roster": 6,             # lineup size (e.g., 6 for DK)
+#   "cap": 50000,            # salary cap
+#   "n": 20,                 # number of lineups to generate
+#   "objective": "proj"|"floor"|"ceil"|"pown"|"opt",
+#   "locks": [driver names],
+#   "excludes": [driver names],
+#   "boosts": {"Name": steps},         # 1 step = +3% to the metric used for objective
+#   "randomness": 0..100,              # % randomization applied to objective per iteration
+#   "global_max_pct": 0..100,          # overall exposure cap per driver across the run
+#   "min_pct": {"Name": 0..100},       # per-driver minimum exposure targets
+#   "max_pct": {"Name": 0..100},       # per-driver maximum exposure caps
+#   "min_diff": 1,                     # uniqueness (Hamming distance vs prior lineups)
+#   "time_limit_ms": 1500,             # OR-Tools per-lineup solve time limit
+#   "groups": [{"mode":"at_most"|"at_least"|"exactly", "count":int, "players":[...]}]
+# }
+#
+# Response (stream):  sequence of JSON parts:
+#   {"drivers":[...], "salary":int, "total":float}  \n\n
+#   ...
+#   {"done":true,"produced":N}                      \n\n
+#
+# Response (batch):
+#   {"lineups":[{"drivers":[...],"salary":int,"total":float}, ...], "produced": N}
 
 from typing import List, Dict, Optional, Literal, Tuple
 from pydantic import BaseModel, Field
@@ -1431,7 +1461,7 @@ from ortools.sat.python import cp_model
 from starlette.responses import StreamingResponse
 import json, random
 
-# ----- models (mirror the frontend) ----------------------------------
+# ---------- Models ----------
 Site = Literal["dk","fd"]
 
 class CupPlayer(BaseModel):
@@ -1443,7 +1473,7 @@ class CupPlayer(BaseModel):
     pown: float  = 0.0   # 0..1
     opt: float   = 0.0   # 0..1
     class Config:
-        extra = "ignore"
+        extra = "ignore"  # tolerate extra fields from the client
 
 class CupGroup(BaseModel):
     mode: Literal["at_most","at_least","exactly"] = "at_most"
@@ -1470,11 +1500,10 @@ class CupSolveRequest(BaseModel):
 
     groups: List[CupGroup] = Field(default_factory=list)
 
-    # tolerated extra hint (the UI may add {series: "cup"})
     class Config:
-        extra = "ignore"
+        extra = "ignore"  # tolerate harmless extras like {"series": "cup"}
 
-# ----- helpers --------------------------------------------------------
+# ---------- Helpers ----------
 def _cup_metric(p: CupPlayer, obj: str) -> float:
     if obj == "proj": return p.proj
     if obj == "floor": return p.floor
@@ -1491,23 +1520,23 @@ def _cup_score(p: CupPlayer, obj: str, rand_pct: float, boost_steps: int) -> flo
         boosted *= (1.0 + random.uniform(-r, r))
     return boosted
 
-def _cup_cap_from_pct(N: int, pct: float) -> int:
+def _cap_from_pct(N: int, pct: float) -> int:
     return int(max(0.0, min(100.0, pct)) / 100.0 * N)
 
-def _cup_player_caps(req: CupSolveRequest) -> Dict[str, int]:
+def _player_caps(req: CupSolveRequest) -> Dict[str, int]:
     N = max(1, int(req.n))
-    gcap = _cup_cap_from_pct(N, req.global_max_pct)
+    gcap = _cap_from_pct(N, req.global_max_pct)
     caps: Dict[str, int] = {}
     for p in req.players:
-        per = _cup_cap_from_pct(N, req.max_pct.get(p.driver, 100.0))
+        per = _cap_from_pct(N, req.max_pct.get(p.driver, 100.0))
         caps[p.driver] = min(per, gcap) if gcap > 0 else 0
     return caps
 
-def _cup_min_need(req: CupSolveRequest, counts: Dict[str, int]) -> Optional[str]:
+def _min_need(req: CupSolveRequest, counts: Dict[str, int]) -> Optional[str]:
     N = max(1, int(req.n))
     needers = []
     for p in req.players:
-        need = _cup_cap_from_pct(N, req.min_pct.get(p.driver, 0.0))
+        need = _cap_from_pct(N, req.min_pct.get(p.driver, 0.0))
         if counts.get(p.driver, 0) < need:
             needers.append(p)
     if not needers:
@@ -1515,14 +1544,14 @@ def _cup_min_need(req: CupSolveRequest, counts: Dict[str, int]) -> Optional[str]
     needers.sort(key=lambda r: r.proj, reverse=True)
     return needers[0].driver
 
-def _cup_scores(req: CupSolveRequest) -> Dict[str, float]:
+def _scores(req: CupSolveRequest) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for p in req.players:
         out[p.driver] = _cup_score(p, req.objective, req.randomness, (req.boosts or {}).get(p.driver, 0))
     return out
 
-# ----- single-lineup solver ------------------------------------------
-def _cup_solve_one(
+# ---------- Single-lineup solver ----------
+def _solve_one_lineup(
     req: CupSolveRequest,
     scores: Dict[str, float],
     used_counts: Dict[str, int],
@@ -1536,21 +1565,21 @@ def _cup_solve_one(
     names = list(by_name.keys())
     roster = int(req.roster)
 
-    # decision vars
+    # decision vars: select driver or not
     y: Dict[str, cp_model.IntVar] = {n: model.NewBoolVar(f"y_{n}") for n in names}
 
     # roster size & salary cap
     model.Add(sum(y[n] for n in names) == roster)
     model.Add(sum(y[n] * by_name[n].salary for n in names) <= req.cap)
 
-    # locks/excludes
+    # locks / excludes
     excl = set(req.excludes or [])
     lock = set(req.locks or [])
     for n in names:
         if n in excl: model.Add(y[n] == 0)
         if n in lock: model.Add(y[n] == 1)
 
-    # exposure caps already hit
+    # exposure caps already hit across the run
     for n in names:
         if used_counts.get(n, 0) >= caps.get(n, 10**9):
             model.Add(y[n] == 0)
@@ -1559,14 +1588,15 @@ def _cup_solve_one(
     if forced_include and forced_include in y:
         model.Add(y[forced_include] == 1)
 
-    # groups
-    for g in req.groups or []:
+    # group rules
+    for g in (req.groups or []):
         vars_in = [y[n] for n in g.players if n in y]
-        if not vars_in: continue
+        if not vars_in:
+            continue
         s = sum(vars_in)
-        if g.mode == "at_most":   model.Add(s <= g.count)
-        elif g.mode == "at_least":model.Add(s >= g.count)
-        elif g.mode == "exactly": model.Add(s == g.count)
+        if g.mode == "at_most":    model.Add(s <= g.count)
+        elif g.mode == "at_least": model.Add(s >= g.count)
+        elif g.mode == "exactly":  model.Add(s == g.count)
 
     # uniqueness vs prior (Hamming distance)
     for prev in prior:
@@ -1592,23 +1622,22 @@ def _cup_solve_one(
     total  = sum(_cup_metric(by_name[n], req.objective) for n in chosen)
     return chosen, salary, total
 
-# ----- STREAM: raw JSON chunks separated by blank lines ----------------
+# ---------- STREAM endpoints (raw JSON parts separated by blank lines) ----------
 @app.post("/cup/solve_stream")
 def cup_solve_stream(req: CupSolveRequest):
     random.seed()
-
     counts: Dict[str, int] = {}
-    caps = _cup_player_caps(req)
+    caps = _player_caps(req)
     prior: List[List[str]] = []
 
     def gen():
         produced = 0
         for _ in range(req.n):
-            sc = _cup_scores(req)
-            forced = _cup_min_need(req, counts)
-            ans = _cup_solve_one(req, sc, counts, caps, forced, prior)
+            sc = _scores(req)
+            forced = _min_need(req, counts)
+            ans = _solve_one_lineup(req, sc, counts, caps, forced, prior)
             if not ans:
-                # send a 'done' chunk then stop
+                # signal completion
                 yield (json.dumps({"done": True, "reason": "no_more_unique_or_exposure_capped", "produced": produced}) + "\n\n").encode()
                 return
             chosen, salary, total = ans
@@ -1620,23 +1649,22 @@ def cup_solve_stream(req: CupSolveRequest):
             yield (json.dumps(chunk) + "\n\n").encode()
         yield (json.dumps({"done": True, "produced": produced}) + "\n\n").encode()
 
-    # no SSE headers on purpose; client parses raw JSON parts
+    # Not using SSE mime on purpose; client reads raw chunked JSON
     return StreamingResponse(gen(), media_type="application/octet-stream")
 
-# ----- BATCH -----------------------------------------------------------
+# ---------- BATCH endpoints ----------
 @app.post("/cup/solve")
 def cup_solve(req: CupSolveRequest):
     random.seed()
-
     counts: Dict[str, int] = {}
-    caps = _cup_player_caps(req)
+    caps = _player_caps(req)
     prior: List[List[str]] = []
     out = []
 
     for _ in range(req.n):
-        sc = _cup_scores(req)
-        forced = _cup_min_need(req, counts)
-        ans = _cup_solve_one(req, sc, counts, caps, forced, prior)
+        sc = _scores(req)
+        forced = _min_need(req, counts)
+        ans = _solve_one_lineup(req, sc, counts, caps, forced, prior)
         if not ans:
             break
         chosen, salary, total = ans
@@ -1646,4 +1674,22 @@ def cup_solve(req: CupSolveRequest):
         out.append({"drivers": sorted(chosen), "salary": salary, "total": total})
 
     return {"lineups": out, "produced": len(out)}
-# ======================= End of NASCAR SIM =======================
+
+# ---------- Aliases for Xfinity & Trucks (reuse the same contract/solver) ----------
+@app.post("/xfinity/solve_stream")
+def xfinity_solve_stream(req: CupSolveRequest):
+    return cup_solve_stream(req)
+
+@app.post("/xfinity/solve")
+def xfinity_solve(req: CupSolveRequest):
+    return cup_solve(req)
+
+@app.post("/trucks/solve_stream")
+def trucks_solve_stream(req: CupSolveRequest):
+    return cup_solve_stream(req)
+
+@app.post("/trucks/solve")
+def trucks_solve(req: CupSolveRequest):
+    return cup_solve(req)
+
+# ======================= END NASCAR DROP-IN =======================
