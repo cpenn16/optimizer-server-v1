@@ -1646,37 +1646,41 @@ def cup_solve(req: CupSolveRequest):
         out.append({"drivers": sorted(chosen), "salary": salary, "total": total})
 
     return {"lineups": out, "produced": len(out)}
-# ===================== END NASCAR (Cup/Xfinity/Trucks) =====================
-# ======================= CUP SIMULATOR ENDPOINTS =======================
-# Powers CupSimulator.jsx: /scale_payouts and /monte_carlo_sim
+# ======================= CUP CONTEST SIMULATOR (DROP-IN) =======================
+# Endpoints:
+#   POST /scale_payouts     -> {payouts:[[place, dollars], ...]}
+#   POST /monte_carlo_sim   -> MonteResp (lineup + driver contest stats)
 
-from typing import Any
+from typing import Any, List, Dict, Tuple, Optional, Literal
 from fastapi import Body
+from pydantic import BaseModel, Field
+import random
 
-# --------- payout scaling ---------
+# ---------- payout scaling ----------
 
 class PayoutTemplate(BaseModel):
-    # Percent of field paid, e.g. 25 = top 25% get paid (GPP default)
-    paid_pct: float = 25.0
-    # Ladder "shape" control points as pairs of [rank_fraction, x_buyin]
-    # rank_fraction is 0..1 percentile of entries (e.g., 0.0=1st, 0.01=top 1%, 0.10=top 10%)
-    # x_buyin is the payout multiple of buy-in at that control point.
-    # Example typical GPP-ish:
-    # [[0.0, 25.0],[0.01,10.0],[0.05,3.0],[0.10,2.0],[0.25,1.5]]
-    shape: List[List[float]] = Field(default_factory=lambda: [[0.0, 25.0],[0.01,10.0],[0.05,3.0],[0.10,2.0],[0.25,1.5]])
+    paid_pct: float = 25.0  # % of field paid
+    # [rank_fraction (0..1), x_buyin]; linear interpolate
+    shape: List[List[float]] = Field(
+        default_factory=lambda: [
+            [0.00, 25.0],
+            [0.01, 10.0],
+            [0.05,  3.0],
+            [0.10,  2.0],
+            [0.25,  1.5],
+        ]
+    )
 
 class ScalePayoutsReq(BaseModel):
     template: PayoutTemplate
     entries: int
     buy_in: float
-    # Optional rake as % of buy-in removed from prize pool (0–100). If omitted, we just scale by x_buyin.
-    rake_pct: Optional[float] = None
+    rake_pct: Optional[float] = None  # optional; not enforced tightly
 
 class ScalePayoutsResp(BaseModel):
     payouts: List[List[float]]  # [[place, dollars], ...]
 
 def _interp_xbuyin(ctrl: List[List[float]], frac: float) -> float:
-    """Linear interpolation of x_buyin at cumulative fraction frac (0..1)."""
     c = sorted(ctrl, key=lambda t: t[0])
     if not c:
         return 1.0
@@ -1695,20 +1699,17 @@ def scale_payouts(payload: ScalePayoutsReq = Body(...)):
     entries = max(1, int(payload.entries))
     buy_in = max(0.0, float(payload.buy_in))
     paid_pct = max(0.0, min(100.0, float(payload.template.paid_pct)))
-    paid_places = max(1, int(entries * (paid_pct / 100.0)))
+    paid_places = max(1, int(round(entries * (paid_pct / 100.0))))
 
-    # If rake provided, you could re-normalize amounts to fit pool; we keep it simple:
-    # payout_amount = x_buyin * buy_in (does not force-sum to prize pool).
     out: List[List[float]] = []
     for place in range(1, paid_places + 1):
         frac = (place - 1) / max(1, entries - 1)  # 0 for 1st, ~1 for last
         xbuy = _interp_xbuyin(payload.template.shape, frac)
         amount = max(0.0, xbuy * buy_in)
         out.append([place, amount])
-
     return ScalePayoutsResp(payouts=out)
 
-# --------- monte carlo simulator ---------
+# ---------- contest simulator ----------
 
 class SimPlayer(BaseModel):
     driver: str
@@ -1719,49 +1720,49 @@ class SimPlayer(BaseModel):
     pown: float = 0.0  # 0..1
 
 class MonteReq(BaseModel):
-    # minimal inputs from CupSimulator.jsx
     players: List[SimPlayer]
     entries: int
     buy_in: float
     payouts: List[List[float]]    # [[place, dollars], ...] from /scale_payouts
     sims: int = 1000
     randomness: float = 12.0      # % projection volatility
-    # Optional (recommended): if passed, we’ll honor them; otherwise DK defaults
     site: Optional[Literal["dk","fd"]] = None
     roster: Optional[int] = None
     cap: Optional[int] = None
-    # Optional: lineup pool controls
-    pool_size: int = 400          # how many unique lineups to build for sampling
-    build_time_limit_ms: int = 600  # per-lineup time limit when seeding pool
+    # lineup pool build
+    pool_size: int = 400
+    build_time_limit_ms: int = 600
 
 class LineupStat(BaseModel):
     lineup: List[str]
-    avg_roi: float
-    cash_pct: float
-    top1_pct: float
+    avg_roi: float      # average ROI across all copies entered
+    win_pct: float      # % of sims where any copy won
+    top10_pct: float    # % of sims where any copy finished top 10%
+    top1_pct: float     # % of sims where any copy finished top 1%
+    cash_pct: float     # per-entry cash rate across all copies
+    dupes_avg: float    # avg copies in the field WHEN this lineup appears
 
 class DriverStat(BaseModel):
     driver: str
-    avg_roi: float
-    cash_pct: float
-    top1_pct: float
+    avg_roi: float      # per-entry driver ROI (equal split)
+    win_pct: float      # % of that driver's entries that finished 1st
+    top10_pct: float    # % of entries in top 10%
+    top1_pct: float     # % of entries in top 1%
+    cash_pct: float     # % of entries that cashed
 
 class MonteResp(BaseModel):
     lineups: List[LineupStat]
     drivers: List[DriverStat]
     sims: int
 
-def _default_roster_and_cap(site: Optional[str]) -> Tuple[int,int]:
+def _default_roster_and_cap(site: Optional[str]) -> Tuple[int, int]:
     if site == "fd":
         return 5, 50000
-    # default DK
-    return 6, 50000
+    return 6, 50000  # DK default
 
 def _gauss_from_floor_ceil(mu: float, floor: float, ceil: float, jitter_pct: float) -> float:
-    # Use floor/ceil as an implied 95% interval => sigma ~ (ceil-floor)/4
     width = max(0.0, ceil - floor)
     sigma = max(0.1, width / 4.0)
-    # global jitter (randomness%) as multiplicative noise around the draw
     base = random.gauss(mu, sigma)
     if jitter_pct > 0:
         r = jitter_pct / 100.0
@@ -1775,19 +1776,18 @@ def _build_lineup_pool(
     pool_size: int,
     per_lineup_time_ms: int,
 ) -> List[List[str]]:
-    """Use existing Cup CP-SAT to build a diverse pool by re-sampling scores each time."""
-    # Adapt SimPlayer -> CupPlayer
+    """Use existing Cup CP-SAT to build a diverse pool by re-sampling scores."""
     cup_players = [CupPlayer(
         driver=p.driver, salary=int(p.salary), proj=float(p.proj),
         floor=float(p.floor), ceil=float(p.ceil), pown=float(p.pown), opt=0.0
     ) for p in players if p.salary > 0 and p.driver]
 
     counts: Dict[str, int] = {}
-    caps = {p.driver: pool_size for p in cup_players}  # no exposure limit while seeding
+    caps = {p.driver: pool_size for p in cup_players}
     prior: List[List[str]] = []
     pool: List[List[str]] = []
+    seen_keys: set = set()
 
-    # We’ll build with objective=proj, but inject score noise to diversify
     dummy_req = CupSolveRequest(
         site="dk", players=cup_players, roster=roster, cap=cap, n=1,
         objective="proj",
@@ -1796,8 +1796,7 @@ def _build_lineup_pool(
         time_limit_ms=per_lineup_time_ms, groups=[]
     )
 
-    for _ in range(pool_size * 2):  # overshoot attempts to handle infeasible uniqueness
-        # randomize scores via (proj +- 10%) and also with floor/ceil width
+    for _ in range(pool_size * 3):  # extra attempts for uniqueness
         scores: Dict[str, float] = {}
         for p in cup_players:
             mu = p.proj
@@ -1805,12 +1804,14 @@ def _build_lineup_pool(
             sigma = max(0.1, width / 4.0)
             s = random.gauss(mu, sigma) * (1.0 + random.uniform(-0.10, +0.10))
             scores[p.driver] = max(0.0, s)
+
         ans = _cup_solve_one(dummy_req, scores, counts, caps, forced_include=None, prior=prior)
         if not ans:
             break
         chosen, _, _ = ans
         key = "|".join(sorted(chosen))
-        if key not in { "|".join(sorted(x)) for x in pool }:
+        if key not in seen_keys:
+            seen_keys.add(key)
             pool.append(chosen)
             prior.append(chosen)
             if len(pool) >= pool_size:
@@ -1826,135 +1827,171 @@ def monte_carlo_sim(payload: MonteReq = Body(...)):
         return MonteResp(lineups=[], drivers=[], sims=0)
 
     roster, cap = (
-        (payload.roster, payload.cap)
+        (int(payload.roster), int(payload.cap))
         if (payload.roster and payload.cap)
         else _default_roster_and_cap(payload.site)
     )
 
-    # 1) Seed a lineup pool with your Cup solver (fast & feasible)
+    # 1) build lineup pool
     pool = _build_lineup_pool(
         players=players,
-        roster=int(roster),
-        cap=int(cap),
+        roster=roster,
+        cap=cap,
         pool_size=max(50, int(payload.pool_size)),
         per_lineup_time_ms=max(100, int(payload.build_time_limit_ms)),
     )
     if not pool:
         return MonteResp(lineups=[], drivers=[], sims=0)
 
-    # Precompute lineup weights from driver ownership (pOWN)
-    # weight(lineup) ~ Π (pown_i + ε), normalized later
+    # ownership weights
     eps = 1e-6
     by_name = {p.driver: p for p in players}
     def lineup_weight(L: List[str]) -> float:
         w = 1.0
         for d in L:
-            w *= max(eps, float(by_name.get(d).pown if by_name.get(d) else 0.0) + eps)
+            w *= max(eps, float(by_name[d].pown) + eps)
         return w
 
-    pool_weights = [lineup_weight(L) for L in pool]
-    total_w = sum(pool_weights) or 1.0
-    probs = [w / total_w for w in pool_weights]
-
-    # Index maps for fast accumulation
-    key_map = {"|".join(sorted(L)): i for i, L in enumerate(pool)}
-    apper_count = [0] * len(pool)   # times lineup appears in the field across sims
-    wins_total  = [0.0] * len(pool) # total $ won across sims
-
-    # Driver accumulators
-    driver_keys = sorted({p.driver for p in players})
-    d_index = {d: i for i, d in enumerate(driver_keys)}
-    d_appear = [0] * len(driver_keys)
-    d_cash   = [0] * len(driver_keys)
-    d_top1   = [0] * len(driver_keys)
-    d_wins   = [0.0] * len(driver_keys)
+    weights = [lineup_weight(L) for L in pool]
+    totw = sum(weights) or 1.0
+    probs = [w / totw for w in weights]
 
     entries = max(1, int(payload.entries))
     buy_in = max(0.0, float(payload.buy_in))
     sims = max(1, int(payload.sims))
-    payouts = [(int(place), float(amt)) for place, amt in payload.payouts or []]
-    payouts.sort(key=lambda t: t[0])  # ascending place
 
-    # 2) Monte Carlo
+    # payout lookup (exact places); ranks beyond last key -> $0
+    payout_map = {int(place): float(amt) for place, amt in (payload.payouts or [])}
+    max_paid_place = max(payout_map.keys(), default=0)
+
+    top1_cut = max(1, int(round(entries * 0.01)))
+    top10_cut = max(1, int(round(entries * 0.10)))
+
+    n_pool = len(pool)
+    plays_total = [0] * n_pool            # total copies across sims
+    cash_plays  = [0] * n_pool            # copies that cashed
+    win_sims    = [0] * n_pool            # sims where any copy won
+    top1_sims   = [0] * n_pool            # sims where any copy was top 1%
+    top10_sims  = [0] * n_pool            # sims where any copy was top 10%
+    dup_sum     = [0] * n_pool            # total copies per sim (summed)
+    appear_sims = [0] * n_pool            # sims where lineup appeared ≥1 time
+    winnings    = [0.0] * n_pool          # total dollars won
+
+    # driver accumulators (per entry)
+    driver_keys = sorted({p.driver for p in players})
+    d_idx = {d: i for i, d in enumerate(driver_keys)}
+    d_plays = [0] * len(driver_keys)
+    d_cash  = [0] * len(driver_keys)
+    d_top1  = [0] * len(driver_keys)
+    d_top10 = [0] * len(driver_keys)
+    d_win   = [0] * len(driver_keys)
+    d_win_sum = [0.0] * len(driver_keys)  # total $ won allocated equally per lineup member
+
     for _ in range(sims):
-        # Sample field lineups by ownership-weighted probabilities (with replacement)
-        sampled_idx: List[int] = random.choices(range(len(pool)), weights=probs, k=entries)
-        # Score each sampled lineup by perturbing each driver's projection
-        scores: List[Tuple[float, int]] = []  # (score, pool_index)
+        # sample field with replacement
+        sampled_idx: List[int] = random.choices(range(n_pool), weights=probs, k=entries)
+        counts: Dict[int, int] = {}
         for pi in sampled_idx:
+            counts[pi] = counts.get(pi, 0) + 1
+        for pi, c in counts.items():
+            dup_sum[pi] += c
+            appear_sims[pi] += 1
+
+        # draw one outcome for the race
+        driver_pts = {d: _gauss_from_floor_ceil(by_name[d].proj, by_name[d].floor, by_name[d].ceil, payload.randomness)
+                      for d in by_name.keys()}
+
+        # score uniques once
+        unique_scores: Dict[int, float] = {}
+        for pi in counts.keys():
+            s = sum(driver_pts[d] for d in pool[pi])
+            unique_scores[pi] = s
+
+        # expand to entries and rank
+        ranked: List[Tuple[float, int]] = []
+        for pi, c in counts.items():
+            ranked.extend([(unique_scores[pi], pi)] * c)
+        ranked.sort(key=lambda t: t[0], reverse=True)
+
+        # best rank per lineup this sim
+        best_rank: Dict[int, int] = {}
+
+        # pay entries, accumulate stats
+        for rank, (_, pi) in enumerate(ranked, start=1):
+            plays_total[pi] += 1
             L = pool[pi]
-            s = 0.0
+            pay = payout_map.get(rank, 0.0) if rank <= max_paid_place else 0.0
+            if pay > 0:
+                cash_plays[pi] += 1
+
+            winnings[pi] += pay
+            if pi not in best_rank:
+                best_rank[pi] = rank
+
+            # driver per-entry stats & earnings split
+            share = (pay / roster) if roster > 0 else 0.0
             for d in L:
-                p = by_name[d]
-                s += _gauss_from_floor_ceil(p.proj, p.floor, p.ceil, payload.randomness)
-            scores.append((s, pi))
-        # Rank high to low
-        scores.sort(key=lambda t: t[0], reverse=True)
+                di = d_idx[d]
+                d_plays[di] += 1
+                d_win_sum[di] += share
+                if pay > 0:
+                    d_cash[di] += 1
+                if rank == 1:
+                    d_win[di] += 1
+                if rank <= top1_cut:
+                    d_top1[di] += 1
+                if rank <= top10_cut:
+                    d_top10[di] += 1
 
-        # Assign payouts to top positions; mark cash + top1
-        for rank_idx, (_, pi) in enumerate(scores, start=1):
-            apper_count[pi] += 1
-            L = pool[pi]
-            # driver appearances
-            for d in L:
-                d_appear[d_index[d]] += 1
+        # convert best-rank → lineup-level sim flags
+        for pi, r in best_rank.items():
+            if r == 1:
+                win_sims[pi] += 1
+            if r <= top1_cut:
+                top1_sims[pi] += 1
+            if r <= top10_cut:
+                top10_sims[pi] += 1
 
-            # find payout for this place if any
-            pay = 0.0
-            # payouts is [[place, amount]]; for ranks beyond provided, pay=0
-            if payouts:
-                # payouts are given as exact places, so we look up exact match if within paid places
-                if rank_idx <= payouts[-1][0]:
-                    # find the last entry with place >= rank_idx
-                    # (if your ladder is dense, you can map directly; here we fall back to linear search)
-                    for pl, amt in payouts:
-                        if pl == rank_idx:
-                            pay = amt
-                            break
-
-            # cash definition: any positive payout
-            cashed = pay > 0.0
-            if cashed:
-                for d in L:
-                    d_cash[d_index[d]] += 1
-            if rank_idx == 1:
-                for d in L:
-                    d_top1[d_index[d]] += 1
-
-            wins_total[pi] += pay
-
-    # 3) Aggregate ROI stats
+    # build lineup stats
     lineup_stats: List[LineupStat] = []
-    for i, L in enumerate(pool):
-        n_plays = apper_count[i]
-        if n_plays == 0:
-            continue
-        cost = n_plays * buy_in
-        roi = (wins_total[i] - cost) / cost if cost > 0 else 0.0
-        # cash% across the times this lineup appeared in the field
-        # We didn’t keep per-lineup cash count; approximate by: any positive winnings implies at least once cashed.
-        # If you want exact cash%, track a separate cash counter per lineup.
-        cash_pct = 100.0 * (1.0 if wins_total[i] > 0 else 0.0)  # simple signal
-        top1_pct = 0.0  # omitted unless you track rank==1 per lineup; can be added similarly
-        lineup_stats.append(LineupStat(lineup=L, avg_roi=roi, cash_pct=cash_pct, top1_pct=top1_pct))
+    for pi, L in enumerate(pool):
+        # avoid div-by-zero
+        cost = plays_total[pi] * buy_in
+        avg_roi = (winnings[pi] - cost) / cost if cost > 0 else 0.0
+        cash_rate = (cash_plays[pi] / plays_total[pi]) * 100.0 if plays_total[pi] else 0.0
+        dupes_avg = (dup_sum[pi] / appear_sims[pi]) if appear_sims[pi] else 0.0
 
-    # Driver stats (per appearance)
-    driver_stats: List[DriverStat] = []
-    for d, idx in d_index.items():
-        n = d_appear[idx]
-        if n == 0:
-            driver_stats.append(DriverStat(driver=d, avg_roi=0.0, cash_pct=0.0, top1_pct=0.0))
-            continue
-        # crude driver ROI proxy: allocate lineup winnings equally among drivers in that lineup by counting appearances
-        # (For more fidelity, track earnings per lineup per sim and split among members.)
-        avg_roi = 0.0  # neutral unless you implement per-driver earnings allocation
-        cash_pct = (d_cash[idx] / n) * 100.0
-        top1_pct = (d_top1[idx] / n) * 100.0
-        driver_stats.append(DriverStat(driver=d, avg_roi=avg_roi, cash_pct=cash_pct, top1_pct=top1_pct))
+        lineup_stats.append(LineupStat(
+            lineup=L,
+            avg_roi=avg_roi,
+            win_pct=(win_sims[pi] / sims) * 100.0,
+            top10_pct=(top10_sims[pi] / sims) * 100.0,
+            top1_pct=(top1_sims[pi] / sims) * 100.0,
+            cash_pct=cash_rate,
+            dupes_avg=dupes_avg,
+        ))
 
-    # Sort lineups by ROI, then cash/top1
     lineup_stats.sort(key=lambda r: (r.avg_roi, r.top1_pct, r.cash_pct), reverse=True)
-    driver_stats.sort(key=lambda r: (r.avg_roi, r.top1_pct, r.cash_pct), reverse=True)
 
+    # build driver stats (per-entry)
+    driver_stats: List[DriverStat] = []
+    cost_per_driver_entry = (buy_in / roster) if roster > 0 else buy_in
+    for d, i in d_idx.items():
+        if d_plays[i] == 0:
+            driver_stats.append(DriverStat(driver=d, avg_roi=0.0, win_pct=0.0, top10_pct=0.0, top1_pct=0.0, cash_pct=0.0))
+            continue
+        earn = d_win_sum[i]
+        spent = d_plays[i] * cost_per_driver_entry
+        d_roi = (earn - spent) / spent if spent > 0 else 0.0
+        driver_stats.append(DriverStat(
+            driver=d,
+            avg_roi=d_roi,
+            win_pct=(d_win[i] / d_plays[i]) * 100.0,
+            top10_pct=(d_top10[i] / d_plays[i]) * 100.0,
+            top1_pct=(d_top1[i] / d_plays[i]) * 100.0,
+            cash_pct=(d_cash[i] / d_plays[i]) * 100.0,
+        ))
+
+    driver_stats.sort(key=lambda r: (r.avg_roi, r.top1_pct, r.cash_pct), reverse=True)
     return MonteResp(lineups=lineup_stats, drivers=driver_stats, sims=sims)
-# ===================== END CUP SIMULATOR ENDPOINTS =====================
+# ===================== END CUP CONTEST SIMULATOR (DROP-IN) =====================
